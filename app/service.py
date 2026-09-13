@@ -42,10 +42,10 @@ class Candidate:
 class AuvelloService:
     def __init__(self) -> None:
         self.ml = MercadoLivreClient()
-        self.discovery = Discovery(self.ml)
+        self.db = Database()
+        self.discovery = Discovery(self.ml, self.db)
         self.classifier = Classifier(self.ml)
         self.affiliate = AffiliateClient()
-        self.db = Database()
         self.whatsapp = WhatsAppClient()
         self._last_send_at: float | None = None
         self._messages_sent_this_run = 0
@@ -68,7 +68,7 @@ class AuvelloService:
                 continue
 
             if candidate is None:
-                group = self.classifier.classify(offer)
+                group = offer.forced_group or self.classifier.classify(offer)
                 if not group:
                     without_group += 1
                 else:
@@ -143,7 +143,7 @@ class AuvelloService:
         print("=== AUVELLO: rodada finalizada ===\n")
 
     def _evaluate(self, product: Product) -> Candidate | None:
-        group = self.classifier.classify(product)
+        group = product.forced_group or self.classifier.classify(product)
         if not group:
             print(f"[ignorado] sem grupo: {product.name}")
             return None

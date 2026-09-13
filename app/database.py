@@ -95,6 +95,20 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_product_notifications
                 ON product_notifications(catalog_product_key, group_key, sent_at)
                 """,
+                """
+                CREATE TABLE IF NOT EXISTS admin_monitored_products (
+                    id BIGSERIAL PRIMARY KEY,
+                    product_id TEXT NOT NULL UNIQUE,
+                    group_key TEXT NOT NULL,
+                    active BOOLEAN NOT NULL DEFAULT TRUE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """,
+                """
+                CREATE INDEX IF NOT EXISTS idx_admin_monitored_products_active
+                ON admin_monitored_products(active, group_key)
+                """,
             ]
         else:
             statements = [
@@ -141,6 +155,20 @@ class Database:
                 """
                 CREATE INDEX IF NOT EXISTS idx_product_notifications
                 ON product_notifications(catalog_product_key, group_key, sent_at)
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS admin_monitored_products (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    product_id TEXT NOT NULL UNIQUE,
+                    group_key TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """,
+                """
+                CREATE INDEX IF NOT EXISTS idx_admin_monitored_products_active
+                ON admin_monitored_products(active, group_key)
                 """,
             ]
 
@@ -247,3 +275,20 @@ class Database:
                     sent_at,
                 ),
             )
+
+    def active_admin_products(self) -> list[dict[str, str]]:
+        """Produtos fixados pelo dev no Auvello Admin."""
+        active_value = True if self.is_postgres else 1
+        p = self._ph
+        sql = f"""
+            SELECT product_id, group_key
+            FROM admin_monitored_products
+            WHERE active = {p}
+            ORDER BY id ASC
+        """
+        with self._connect() as conn:
+            rows = conn.execute(sql, (active_value,)).fetchall()
+        return [
+            {"product_id": str(row["product_id"]), "group_key": str(row["group_key"])}
+            for row in rows
+        ]

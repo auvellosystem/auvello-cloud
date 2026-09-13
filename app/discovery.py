@@ -7,6 +7,7 @@ from collections import Counter
 from .mercado_livre import MercadoLivreClient
 from .models import Product
 from .config import settings
+from .database import Database
 
 
 AUVELLO_ROOTS = {
@@ -30,8 +31,9 @@ class Discovery:
     Não depende de pai/filho.
     """
 
-    def __init__(self, ml: MercadoLivreClient) -> None:
+    def __init__(self, ml: MercadoLivreClient, db: Database | None = None) -> None:
         self.ml = ml
+        self.db = db
 
     def run(self) -> list[Product]:
         offers: dict[str, Product] = {}
@@ -44,6 +46,11 @@ class Discovery:
 
         if getattr(settings, "discovery_trends", True):
             self._from_trends(offers)
+
+        # Produtos fixados pelo dev entram por ultimo para que o grupo escolhido
+        # no Admin prevaleca se a mesma oferta tambem vier de outra fonte.
+        # Continua sendo uma fonte aditiva: nao substitui Highlights/Watchlist/Trends.
+        self._from_admin(offers)
 
         print(f"[discovery] {len(offers)} ofertas únicas encontradas")
         return list(offers.values())
@@ -190,6 +197,43 @@ class Discovery:
                 )
             except Exception as exc:
                 print(f"[watchlist/id] {code!r}: {exc}")
+
+    def _from_admin(self, out: dict[str, Product]) -> None:
+        """
+        Busca os PRODUCT_IDs cadastrados no Auvello Admin em toda rodada.
+        O grupo escolhido no painel e aplicado como override apenas a esses
+        produtos; todas as regras de elegibilidade/score/slots continuam.
+        """
+        if self.db is None:
+            return
+
+        try:
+            monitored = self.db.active_admin_products()
+        except Exception as exc:
+            print(f"[admin] erro lendo produtos monitorados: {exc}")
+            return
+
+        if not monitored:
+            print("[admin] nenhum produto fixado")
+            return
+
+        for entry in monitored:
+            product_id = entry.get("product_id")
+            group_key = entry.get("group_key")
+            if not product_id or not group_key:
+                continue
+            try:
+                offers = self.ml.product_offers(product_id)
+                for offer in offers:
+                    offer.forced_group = group_key
+                    offer.discovery_source = "admin"
+                found = self._add_many(out, offers)
+                print(
+                    f"[admin] {product_id} -> {group_key}: "
+                    f"{len(offers)} ofertas, {found} novas"
+                )
+            except Exception as exc:
+                print(f"[admin] {product_id}: {exc}")
 
     def _from_trends(self, out: dict[str, Product]) -> None:
         """

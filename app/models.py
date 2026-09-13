@@ -13,6 +13,10 @@ class Product:
     currency_id: str
     permalink: str
     picture: str | None = None
+    # Quando o produto vem do Auvello Admin, o grupo escolhido pelo dev
+    # prevalece sobre a classificacao automatica. Fontes normais deixam None.
+    forced_group: str | None = None
+    discovery_source: str | None = None
 
     @property
     def discount_percent(self) -> float:
