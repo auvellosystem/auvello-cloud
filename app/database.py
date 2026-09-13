@@ -62,10 +62,7 @@ class Database:
                     captured_at TIMESTAMPTZ NOT NULL
                 )
                 """,
-                """
-                CREATE INDEX IF NOT EXISTS idx_price_history_product
-                ON price_history(product_key, captured_at)
-                """,
+                """CREATE INDEX IF NOT EXISTS idx_price_history_product ON price_history(product_key, captured_at)""",
                 """
                 CREATE TABLE IF NOT EXISTS notifications (
                     id BIGSERIAL PRIMARY KEY,
@@ -76,10 +73,7 @@ class Database:
                     sent_at TIMESTAMPTZ NOT NULL
                 )
                 """,
-                """
-                CREATE INDEX IF NOT EXISTS idx_notifications_product
-                ON notifications(product_key, group_key, sent_at)
-                """,
+                """CREATE INDEX IF NOT EXISTS idx_notifications_product ON notifications(product_key, group_key, sent_at)""",
                 """
                 CREATE TABLE IF NOT EXISTS product_notifications (
                     id BIGSERIAL PRIMARY KEY,
@@ -91,10 +85,7 @@ class Database:
                     sent_at TIMESTAMPTZ NOT NULL
                 )
                 """,
-                """
-                CREATE INDEX IF NOT EXISTS idx_product_notifications
-                ON product_notifications(catalog_product_key, group_key, sent_at)
-                """,
+                """CREATE INDEX IF NOT EXISTS idx_product_notifications ON product_notifications(catalog_product_key, group_key, sent_at)""",
                 """
                 CREATE TABLE IF NOT EXISTS admin_monitored_products (
                     id BIGSERIAL PRIMARY KEY,
@@ -105,10 +96,30 @@ class Database:
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
                 """,
+                """CREATE INDEX IF NOT EXISTS idx_admin_monitored_products_active ON admin_monitored_products(active, group_key)""",
                 """
-                CREATE INDEX IF NOT EXISTS idx_admin_monitored_products_active
-                ON admin_monitored_products(active, group_key)
+                CREATE TABLE IF NOT EXISTS offer_candidates (
+                    catalog_product_key TEXT PRIMARY KEY,
+                    product_id TEXT,
+                    item_id TEXT,
+                    name TEXT NOT NULL,
+                    category_id TEXT,
+                    domain_id TEXT,
+                    price DOUBLE PRECISION NOT NULL,
+                    original_price DOUBLE PRECISION,
+                    currency_id TEXT NOT NULL,
+                    permalink TEXT NOT NULL,
+                    picture TEXT,
+                    forced_group TEXT,
+                    discovery_source TEXT,
+                    group_key TEXT NOT NULL,
+                    previous_price DOUBLE PRECISION,
+                    drop_percent DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    score DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    updated_at TIMESTAMPTZ NOT NULL
+                )
                 """,
+                """CREATE INDEX IF NOT EXISTS idx_offer_candidates_group_updated ON offer_candidates(group_key, updated_at)""",
                 """
                 CREATE TABLE IF NOT EXISTS community_requests (
                     id BIGSERIAL PRIMARY KEY,
@@ -126,10 +137,7 @@ class Database:
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
                 """,
-                """
-                CREATE INDEX IF NOT EXISTS idx_community_requests_status
-                ON community_requests(status, approved_group_key, created_at)
-                """,
+                """CREATE INDEX IF NOT EXISTS idx_community_requests_status ON community_requests(status, approved_group_key, created_at)""",
             ]
         else:
             statements = [
@@ -144,10 +152,7 @@ class Database:
                     captured_at TEXT NOT NULL
                 )
                 """,
-                """
-                CREATE INDEX IF NOT EXISTS idx_price_history_product
-                ON price_history(product_key, captured_at)
-                """,
+                """CREATE INDEX IF NOT EXISTS idx_price_history_product ON price_history(product_key, captured_at)""",
                 """
                 CREATE TABLE IF NOT EXISTS notifications (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -158,10 +163,7 @@ class Database:
                     sent_at TEXT NOT NULL
                 )
                 """,
-                """
-                CREATE INDEX IF NOT EXISTS idx_notifications_product
-                ON notifications(product_key, group_key, sent_at)
-                """,
+                """CREATE INDEX IF NOT EXISTS idx_notifications_product ON notifications(product_key, group_key, sent_at)""",
                 """
                 CREATE TABLE IF NOT EXISTS product_notifications (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -173,10 +175,7 @@ class Database:
                     sent_at TEXT NOT NULL
                 )
                 """,
-                """
-                CREATE INDEX IF NOT EXISTS idx_product_notifications
-                ON product_notifications(catalog_product_key, group_key, sent_at)
-                """,
+                """CREATE INDEX IF NOT EXISTS idx_product_notifications ON product_notifications(catalog_product_key, group_key, sent_at)""",
                 """
                 CREATE TABLE IF NOT EXISTS admin_monitored_products (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -187,10 +186,30 @@ class Database:
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """,
+                """CREATE INDEX IF NOT EXISTS idx_admin_monitored_products_active ON admin_monitored_products(active, group_key)""",
                 """
-                CREATE INDEX IF NOT EXISTS idx_admin_monitored_products_active
-                ON admin_monitored_products(active, group_key)
+                CREATE TABLE IF NOT EXISTS offer_candidates (
+                    catalog_product_key TEXT PRIMARY KEY,
+                    product_id TEXT,
+                    item_id TEXT,
+                    name TEXT NOT NULL,
+                    category_id TEXT,
+                    domain_id TEXT,
+                    price REAL NOT NULL,
+                    original_price REAL,
+                    currency_id TEXT NOT NULL,
+                    permalink TEXT NOT NULL,
+                    picture TEXT,
+                    forced_group TEXT,
+                    discovery_source TEXT,
+                    group_key TEXT NOT NULL,
+                    previous_price REAL,
+                    drop_percent REAL NOT NULL DEFAULT 0,
+                    score REAL NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                )
                 """,
+                """CREATE INDEX IF NOT EXISTS idx_offer_candidates_group_updated ON offer_candidates(group_key, updated_at)""",
                 """
                 CREATE TABLE IF NOT EXISTS community_requests (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -208,10 +227,7 @@ class Database:
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """,
-                """
-                CREATE INDEX IF NOT EXISTS idx_community_requests_status
-                ON community_requests(status, approved_group_key, created_at)
-                """,
+                """CREATE INDEX IF NOT EXISTS idx_community_requests_status ON community_requests(status, approved_group_key, created_at)""",
             ]
 
         with self._connect() as conn:
@@ -317,6 +333,87 @@ class Database:
                     sent_at,
                 ),
             )
+
+    def upsert_offer_candidates(self, candidates: list[dict[str, Any]]) -> int:
+        """Atualiza o cache persistente de candidatos elegíveis.
+
+        O cache é compartilhado pelos grupos específicos e pelo Geral. Uma
+        descoberta nova sobrescreve os dados do mesmo PRODUCT_ID, sem depender
+        da memória do processo (importante para reinícios do Render).
+        """
+        if not candidates:
+            return 0
+
+        p = self._ph
+        now = datetime.now(timezone.utc)
+        stored_now = now if self.is_postgres else now.isoformat()
+        sql = f"""
+            INSERT INTO offer_candidates (
+                catalog_product_key, product_id, item_id, name, category_id,
+                domain_id, price, original_price, currency_id, permalink,
+                picture, forced_group, discovery_source, group_key,
+                previous_price, drop_percent, score, updated_at
+            ) VALUES (
+                {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p},
+                {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}
+            )
+            ON CONFLICT(catalog_product_key) DO UPDATE SET
+                product_id = excluded.product_id,
+                item_id = excluded.item_id,
+                name = excluded.name,
+                category_id = excluded.category_id,
+                domain_id = excluded.domain_id,
+                price = excluded.price,
+                original_price = excluded.original_price,
+                currency_id = excluded.currency_id,
+                permalink = excluded.permalink,
+                picture = excluded.picture,
+                forced_group = excluded.forced_group,
+                discovery_source = excluded.discovery_source,
+                group_key = excluded.group_key,
+                previous_price = excluded.previous_price,
+                drop_percent = excluded.drop_percent,
+                score = excluded.score,
+                updated_at = excluded.updated_at
+        """
+        with self._connect() as conn:
+            for c in candidates:
+                conn.execute(sql, (
+                    c["catalog_product_key"], c.get("product_id"), c.get("item_id"),
+                    c["name"], c.get("category_id"), c.get("domain_id"), c["price"],
+                    c.get("original_price"), c.get("currency_id") or "BRL",
+                    c["permalink"], c.get("picture"), c.get("forced_group"),
+                    c.get("discovery_source"), c["group_key"], c.get("previous_price"),
+                    c.get("drop_percent", 0.0), c.get("score", 0.0), stored_now,
+                ))
+        return len(candidates)
+
+    def prune_offer_candidates(self) -> int:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=settings.candidate_cache_ttl_minutes)
+        stored_cutoff = cutoff if self.is_postgres else cutoff.isoformat()
+        p = self._ph
+        with self._connect() as conn:
+            cur = conn.execute(f"DELETE FROM offer_candidates WHERE updated_at < {p}", (stored_cutoff,))
+            return max(0, int(cur.rowcount or 0))
+
+    def offer_candidates(self, group_key: str | None = None) -> list[dict[str, Any]]:
+        """Lê somente candidatos ainda frescos no cache."""
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=settings.candidate_cache_ttl_minutes)
+        stored_cutoff = cutoff if self.is_postgres else cutoff.isoformat()
+        p = self._ph
+        params: list[Any] = [stored_cutoff]
+        where_group = ""
+        if group_key:
+            where_group = f" AND group_key = {p}"
+            params.append(group_key)
+        sql = f"""
+            SELECT * FROM offer_candidates
+            WHERE updated_at >= {p}{where_group}
+            ORDER BY updated_at DESC, score DESC
+        """
+        with self._connect() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        return [dict(row) for row in rows]
 
     def active_admin_products(self) -> list[dict[str, str]]:
         """Produtos fixados pelo dev no Auvello Admin."""

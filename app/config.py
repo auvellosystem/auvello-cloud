@@ -46,16 +46,24 @@ class Settings:
     big_discount_percent: float = _float("BIG_DISCOUNT_PERCENT", 20)
     min_price_drop_percent: float = _float("MIN_PRICE_DROP_PERCENT", 10)
     cooldown_hours: int = _int("COOLDOWN_HOURS", 24)
-    check_interval_minutes: int = _int("CHECK_INTERVAL_MINUTES", 30)
+    # Scheduler desacoplado: descoberta no Mercado Livre e publicação usam
+    # relógios independentes. O grupo Geral reaproveita o cache e não força
+    # uma nova busca no Mercado Livre a cada 5 minutos.
+    discovery_interval_minutes: int = _int("DISCOVERY_INTERVAL_MINUTES", 10)
+    specific_group_interval_minutes: int = _int("SPECIFIC_GROUP_INTERVAL_MINUTES", 10)
+    general_group_interval_minutes: int = _int("GENERAL_GROUP_INTERVAL_MINUTES", 5)
+    candidate_cache_ttl_minutes: int = _int("CANDIDATE_CACHE_TTL_MINUTES", 30)
 
     # Controles de publicação/WhatsApp.
     # 12 s = no máximo ~5 disparos/minuto durante uma fila normal.
     whatsapp_send_delay_seconds: float = _float("WHATSAPP_SEND_DELAY_SECONDS", 12)
     whatsapp_rate_limit_retry_seconds: float = _float("WHATSAPP_RATE_LIMIT_RETRY_SECONDS", 30)
     whatsapp_max_retries: int = _int("WHATSAPP_MAX_RETRIES", 2)
-    # 20 mensagens por rodada por padrão para evitar uma enxurrada acidental.
-    # Use 0 se quiser remover o limite depois que tudo estiver validado.
-    max_messages_per_run: int = _int("MAX_MESSAGES_PER_RUN", 20)
+    # Airbag de segurança por ciclo de publicação. Como cada envio em grupo
+    # específico também pode ser espelhado no Geral, o teto precisa comportar
+    # os dois destinos. Use 0 para desabilitar o airbag.
+    max_messages_per_cycle: int = _int("MAX_MESSAGES_PER_CYCLE", 70)
+    max_products_general: int = _int("MAX_PRODUCTS_GENERAL", 5)
 
     # Auvello Score: desconto + economia em reais + acessibilidade.
     score_discount_weight: float = _float("SCORE_DISCOUNT_WEIGHT", 0.45)
@@ -93,7 +101,10 @@ class Settings:
             "games_acessorios": os.getenv("WA_GROUP_GAMES", ""),
             "utilidades_domesticas": os.getenv("WA_GROUP_UTILIDADES", ""),
             "pet_shop": os.getenv("WA_GROUP_PET", ""),
-            "maiores_descontos": os.getenv("WA_GROUP_MAIORES_DESCONTOS", ""),
+            # O antigo grupo "Maiores Descontos" foi reaproveitado como Geral.
+            # WA_GROUP_GERAL é o nome novo; a variável antiga continua aceita
+            # para não exigir troca imediata no Render.
+            "geral": os.getenv("WA_GROUP_GERAL", "") or os.getenv("WA_GROUP_MAIORES_DESCONTOS", ""),
         }
 
 

@@ -265,7 +265,7 @@ app.get("/admin", adminAuth, (_req, res) => {
       <select id="group">${Object.entries(ADMIN_GROUPS).map(([key,label]) => `<option value="${key}">${label}</option>`).join("")}</select>
       <button id="add">+ ADICIONAR</button>
     </div>
-    <div class="hint">O cadastro não força publicação. O produto será consultado em todas as rodadas e ainda precisa passar pelas regras atuais de desconto, score, slots e cooldown. “Maiores Descontos” continua automático.</div>
+    <div class="hint">O cadastro não força publicação. O produto será consultado em todas as rodadas e ainda precisa passar pelas regras atuais de desconto, score, slots e cooldown. O grupo Geral continua automático e não é selecionável aqui.</div>
     <div id="message" class="msg"></div>
   </section>
 

@@ -15,6 +15,9 @@ from .models import Product
 from .whatsapp import WhatsAppClient
 
 
+GENERAL_GROUP = "geral"
+
+
 @dataclass
 class Candidate:
     product: Product
@@ -48,10 +51,16 @@ class AuvelloService:
         self.affiliate = AffiliateClient()
         self.whatsapp = WhatsAppClient()
         self._last_send_at: float | None = None
-        self._messages_sent_this_run = 0
+        self._messages_sent_this_cycle = 0
 
+    # Compatibilidade com --once: faz uma descoberta e publica os dois fluxos.
     def run_once(self) -> None:
-        print("\n=== AUVELLO: iniciando rodada ===")
+        self.run_discovery()
+        self.run_specific_groups()
+        self.run_general_group()
+
+    def run_discovery(self) -> None:
+        print("\n=== AUVELLO: descoberta central ===")
         offers = self.discovery.run()
         print(f"[discovery] {len(offers)} ofertas unicas recebidas pelo servico")
 
@@ -59,7 +68,6 @@ class AuvelloService:
         without_group = 0
         not_qualified = 0
 
-        # Analisa todas as ofertas e preserva histórico por ITEM/oferta.
         for offer in offers:
             try:
                 candidate = self._evaluate(offer)
@@ -79,8 +87,6 @@ class AuvelloService:
             if product_key:
                 candidates_by_product.setdefault(product_key, []).append(candidate)
 
-        # UMA oferta por PRODUCT_ID: primeiro elegibilidade por oferta; depois
-        # escolhe a oferta de menor preço daquele produto.
         best_per_product: list[Candidate] = []
         suppressed_siblings = 0
         for candidates in candidates_by_product.values():
@@ -88,59 +94,99 @@ class AuvelloService:
             best_per_product.append(best)
             suppressed_siblings += max(0, len(candidates) - 1)
 
-        # Auvello Score é calculado dentro de cada grupo para comparar coisas
-        # comparáveis: 45% desconto + 30% economia em R$ + 25% acessibilidade.
         by_group: dict[str, list[Candidate]] = {}
         for c in best_per_product:
             by_group.setdefault(c.group, []).append(c)
         for pool in by_group.values():
             self._assign_scores(pool)
 
-        # Slots de oportunidade, por grupo. Slot vazio NÃO é preenchido por
-        # produto fraco só para alcançar a quantidade máxima.
-        selected: list[Candidate] = []
-        for group, pool in by_group.items():
-            group_selected = self._select_opportunity_slots(pool)
-            selected.extend(group_selected)
-            print(
-                f"[slots] {group}: {len(pool)} produtos elegiveis -> "
-                f"{len(group_selected)} selecionados"
-            )
-            for c in group_selected:
-                print(
-                    f"  [score] {c.product.name[:70]} | "
-                    f"{c.effective_discount:.1f}% | economia R$ {c.savings:.2f} | "
-                    f"preco R$ {(c.product.price or 0):.2f} | score {c.score:.1f}"
-                )
+        records = [self._candidate_to_record(c) for c in best_per_product]
+        updated = self.db.upsert_offer_candidates(records)
+        pruned = self.db.prune_offer_candidates()
 
+        print(
+            f"[cache] {updated} candidatos atualizados; {pruned} expirados removidos; "
+            f"TTL={settings.candidate_cache_ttl_minutes} min"
+        )
         print(
             f"[controle] {sum(len(v) for v in candidates_by_product.values())} "
             f"ofertas elegiveis -> {len(best_per_product)} PRODUCTs; "
-            f"{suppressed_siblings} ofertas irmas suprimidas; "
-            f"{len(selected)} oportunidades selecionadas"
+            f"{suppressed_siblings} ofertas irmas suprimidas"
         )
         if without_group:
             print(f"[controle] {without_group} ofertas sem grupo")
         if not_qualified:
             print(f"[controle] {not_qualified} ofertas sem alerta")
+        print("=== AUVELLO: descoberta finalizada ===\n")
 
-        self._messages_sent_this_run = 0
-        self._last_send_at = None
+    def run_specific_groups(self) -> None:
+        print("\n=== AUVELLO: grupos especificos ===")
+        self._begin_send_cycle()
+        rows = self.db.offer_candidates()
+        candidates = [self._candidate_from_record(row) for row in rows]
 
-        # Alterna os grupos por score para não concentrar toda a fila em um
-        # único grupo quando houver um limite global de segurança.
+        by_group: dict[str, list[Candidate]] = {}
+        for candidate in candidates:
+            if candidate.group == GENERAL_GROUP:
+                continue
+            by_group.setdefault(candidate.group, []).append(candidate)
+
+        selected: list[Candidate] = []
+        for group, pool in by_group.items():
+            self._assign_scores(pool)
+            available = [c for c in pool if self.db.can_notify(c.product, group)]
+            group_selected = self._select_opportunity_slots(available)
+            selected.extend(group_selected)
+            print(
+                f"[slots] {group}: {len(pool)} no cache, {len(available)} fora do cooldown -> "
+                f"{len(group_selected)} selecionados"
+            )
+
+        # Alterna oportunidades por score, mantendo o teto de cada grupo já
+        # aplicado acima. Cada envio confirmado é espelhado imediatamente.
         selected.sort(key=lambda c: -c.score)
         for candidate in selected:
             if self._message_limit_reached():
-                print(f"[fila] limite global atingido: {settings.max_messages_per_run} mensagens")
+                print(f"[fila] airbag atingido: {settings.max_messages_per_cycle} mensagens")
                 break
             try:
-                self._publish(candidate)
+                self._publish_specific_and_mirror(candidate)
             except Exception as exc:
                 print(f"[produto] {candidate.product.product_id}: {exc}")
 
-        print(f"[fila] {self._messages_sent_this_run} mensagens enviadas nesta rodada")
-        print("=== AUVELLO: rodada finalizada ===\n")
+        print(f"[fila] {self._messages_sent_this_cycle} mensagens enviadas neste ciclo especifico")
+        print("=== AUVELLO: grupos especificos finalizados ===\n")
+
+    def run_general_group(self) -> None:
+        print("\n=== AUVELLO: grupo Geral ===")
+        self._begin_send_cycle()
+        rows = self.db.offer_candidates()
+        candidates = [self._candidate_from_record(row) for row in rows]
+        available = [c for c in candidates if self.db.can_notify(c.product, GENERAL_GROUP)]
+
+        # O Geral compara todas as categorias no mesmo pool. O score é
+        # recalculado globalmente para que as melhores oportunidades concorram.
+        self._assign_scores(available)
+        available.sort(
+            key=lambda c: (c.score, c.effective_discount, c.savings),
+            reverse=True,
+        )
+        selected = available[: settings.max_products_general]
+        print(
+            f"[geral] {len(candidates)} candidatos no cache, {len(available)} fora do cooldown -> "
+            f"{len(selected)} selecionados"
+        )
+
+        for candidate in selected:
+            if self._message_limit_reached():
+                break
+            try:
+                self._publish_general(candidate, reason="rotina")
+            except Exception as exc:
+                print(f"[geral] {candidate.product.product_id}: {exc}")
+
+        print(f"[fila] {self._messages_sent_this_cycle} mensagens enviadas na rotina Geral")
+        print("=== AUVELLO: grupo Geral finalizado ===\n")
 
     def _evaluate(self, product: Product) -> Candidate | None:
         group = product.forced_group or self.classifier.classify(product)
@@ -178,15 +224,15 @@ class AuvelloService:
         return (value - lo) / (hi - lo)
 
     def _assign_scores(self, pool: list[Candidate]) -> None:
+        if not pool:
+            return
         discounts = [c.effective_discount for c in pool]
-        # log1p evita que um produto caríssimo domine a economia em reais.
         savings_log = [math.log1p(max(0.0, c.savings)) for c in pool]
         prices_log = [math.log1p(max(0.0, c.product.price or 0.0)) for c in pool]
 
         for c in pool:
             discount_n = self._norm(c.effective_discount, discounts)
             saving_n = self._norm(math.log1p(max(0.0, c.savings)), savings_log)
-            # Menor preço = maior acessibilidade.
             price_n = self._norm(math.log1p(max(0.0, c.product.price or 0.0)), prices_log)
             accessibility_n = 1.0 - price_n
             c.score = 100.0 * (
@@ -208,14 +254,12 @@ class AuvelloService:
             chosen.append(best)
             return best
 
-        # 2 vagas: maiores descontos absolutos. Exige desconto forte.
         for _ in range(settings.slot_top_discount_count):
             take_best(
                 lambda c: c.effective_discount >= settings.slot_min_strong_discount,
                 lambda c: (c.effective_discount, c.score, c.savings),
             )
 
-        # 1 vaga: maior economia em reais, mas ainda exige desconto mínimo.
         take_best(
             lambda c: (
                 c.effective_discount >= settings.min_discount_percent
@@ -224,7 +268,6 @@ class AuvelloService:
             lambda c: (c.savings, c.effective_discount, c.score),
         )
 
-        # 1 vaga: produto acessível + desconto realmente bom.
         take_best(
             lambda c: (
                 (c.product.price or float("inf")) <= settings.slot_accessible_max_price
@@ -233,8 +276,6 @@ class AuvelloService:
             lambda c: (c.effective_discount, c.score, c.savings),
         )
 
-        # 1 vaga: melhor oportunidade geral. Score mínimo impede preencher
-        # a vaga com qualquer coisa só porque sobrou espaço.
         take_best(
             lambda c: (
                 c.score >= settings.slot_min_score
@@ -245,33 +286,55 @@ class AuvelloService:
 
         return chosen[: settings.max_products_per_group]
 
-    def _publish(self, candidate: Candidate) -> None:
+    def _publish_specific_and_mirror(self, candidate: Candidate) -> None:
         product, group = candidate.product, candidate.group
-        normal_allowed = self.db.can_notify(product, group)
-        big_allowed = (
-            product.discount_percent >= settings.big_discount_percent
-            and self.db.can_notify(product, "maiores_descontos")
-        )
-        if not normal_allowed and not big_allowed:
-            print(f"[cooldown] {product.name}")
+        if not self.db.can_notify(product, group):
+            print(f"[cooldown] {group}: {product.name}")
             return
 
+        affiliate_url = self._affiliate_url(product)
+        if not affiliate_url:
+            return
+        message = build_message(product, affiliate_url, candidate.previous_price)
+
+        if self._queued_send(group, message, product.picture):
+            self.db.mark_notified(product, group)
+            print(
+                f"[enviado] {group}: {product.name} | R$ {(product.price or 0):.2f} | "
+                f"score={candidate.score:.1f}"
+            )
+
+            # Regra Auvello: específico -> Geral imediatamente, independente
+            # do relógio de 5 minutos. O inverso nunca acontece.
+            if not self._message_limit_reached() and self.db.can_notify(product, GENERAL_GROUP):
+                if self._queued_send(GENERAL_GROUP, message, product.picture):
+                    self.db.mark_notified(product, GENERAL_GROUP)
+                    print(f"[espelho] {group} -> geral: {product.name}")
+            else:
+                print(f"[espelho] geral em cooldown: {product.name}")
+
+    def _publish_general(self, candidate: Candidate, reason: str) -> None:
+        product = candidate.product
+        if not self.db.can_notify(product, GENERAL_GROUP):
+            print(f"[cooldown] geral: {product.name}")
+            return
+        affiliate_url = self._affiliate_url(product)
+        if not affiliate_url:
+            return
+        message = build_message(product, affiliate_url, candidate.previous_price)
+        if self._queued_send(GENERAL_GROUP, message, product.picture):
+            self.db.mark_notified(product, GENERAL_GROUP)
+            print(
+                f"[enviado] geral/{reason}: {product.name} | "
+                f"R$ {(product.price or 0):.2f} | score={candidate.score:.1f}"
+            )
+
+    def _affiliate_url(self, product: Product) -> str | None:
         try:
-            affiliate_url = self.affiliate.build(product.permalink)
+            return self.affiliate.build(product.permalink)
         except AffiliateError as exc:
             print(f"[afiliado] {product.name}: {exc}")
-            return
-
-        message = build_message(product, affiliate_url, candidate.previous_price)
-        if normal_allowed and not self._message_limit_reached():
-            if self._queued_send(group, message, product.picture):
-                self.db.mark_notified(product, group)
-                print(f"[enviado] {group}: {product.name} | R$ {product.price:.2f} | score={candidate.score:.1f}")
-
-        if big_allowed and not self._message_limit_reached():
-            if self._queued_send("maiores_descontos", message, product.picture):
-                self.db.mark_notified(product, "maiores_descontos")
-                print(f"[enviado] maiores_descontos: {product.name} | {product.discount_percent:.1f}% OFF")
+            return None
 
     def _queued_send(self, group: str, message: str, image_url: str | None = None) -> bool:
         if self._last_send_at is not None:
@@ -283,9 +346,59 @@ class AuvelloService:
         ok = self.whatsapp.send(group, message, image_url=image_url)
         self._last_send_at = time.monotonic()
         if ok:
-            self._messages_sent_this_run += 1
+            self._messages_sent_this_cycle += 1
         return ok
 
+    def _begin_send_cycle(self) -> None:
+        self._messages_sent_this_cycle = 0
+
     def _message_limit_reached(self) -> bool:
-        limit = settings.max_messages_per_run
-        return limit > 0 and self._messages_sent_this_run >= limit
+        limit = settings.max_messages_per_cycle
+        return limit > 0 and self._messages_sent_this_cycle >= limit
+
+    @staticmethod
+    def _candidate_to_record(candidate: Candidate) -> dict:
+        p = candidate.product
+        return {
+            "catalog_product_key": p.product_id or p.item_id,
+            "product_id": p.product_id,
+            "item_id": p.item_id,
+            "name": p.name,
+            "category_id": p.category_id,
+            "domain_id": p.domain_id,
+            "price": p.price or 0.0,
+            "original_price": p.original_price,
+            "currency_id": p.currency_id,
+            "permalink": p.permalink,
+            "picture": p.picture,
+            "forced_group": p.forced_group,
+            "discovery_source": p.discovery_source,
+            "group_key": candidate.group,
+            "previous_price": candidate.previous_price,
+            "drop_percent": candidate.drop_percent,
+            "score": candidate.score,
+        }
+
+    @staticmethod
+    def _candidate_from_record(row: dict) -> Candidate:
+        product = Product(
+            product_id=row.get("product_id") or row.get("catalog_product_key") or "",
+            item_id=row.get("item_id"),
+            name=row.get("name") or "Produto",
+            category_id=row.get("category_id"),
+            domain_id=row.get("domain_id"),
+            price=float(row.get("price") or 0),
+            original_price=(float(row["original_price"]) if row.get("original_price") is not None else None),
+            currency_id=row.get("currency_id") or "BRL",
+            permalink=row.get("permalink") or "",
+            picture=row.get("picture"),
+            forced_group=row.get("forced_group"),
+            discovery_source=row.get("discovery_source"),
+        )
+        return Candidate(
+            product=product,
+            group=row.get("group_key") or "",
+            previous_price=(float(row["previous_price"]) if row.get("previous_price") is not None else None),
+            drop_percent=float(row.get("drop_percent") or 0),
+            score=float(row.get("score") or 0),
+        )
