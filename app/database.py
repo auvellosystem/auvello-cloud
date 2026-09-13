@@ -9,6 +9,16 @@ from .config import settings
 from .models import Product
 
 
+DEFAULT_CATEGORY_NAMES = {
+    "eletronicos_tecnologia": "Eletrônicos e Tecnologia",
+    "moda_vestuario": "Moda e Vestuário",
+    "celulares_acessorios": "Celulares e Acessórios",
+    "games_acessorios": "Games e Acessórios",
+    "utilidades_domesticas": "Utilidades Domésticas",
+    "pet_shop": "Pet Shop",
+}
+
+
 class Database:
     """Banco do Auvello.
 
@@ -22,6 +32,7 @@ class Database:
     def __init__(self) -> None:
         self.is_postgres = bool(settings.database_url)
         self._init()
+        self._seed_default_categories()
         backend = "PostgreSQL/Neon" if self.is_postgres else f"SQLite ({settings.database_path})"
         print(f"[database] usando {backend}")
 
@@ -97,6 +108,21 @@ class Database:
                 )
                 """,
                 """CREATE INDEX IF NOT EXISTS idx_admin_monitored_products_active ON admin_monitored_products(active, group_key)""",
+                """
+                CREATE TABLE IF NOT EXISTS auvello_categories (
+                    id BIGSERIAL PRIMARY KEY,
+                    group_key TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL,
+                    whatsapp_group_id TEXT,
+                    search_term TEXT,
+                    active BOOLEAN NOT NULL DEFAULT TRUE,
+                    public_visible BOOLEAN NOT NULL DEFAULT TRUE,
+                    mirror_to_general BOOLEAN NOT NULL DEFAULT TRUE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """,
+                """CREATE INDEX IF NOT EXISTS idx_auvello_categories_active ON auvello_categories(active, public_visible)""",
                 """
                 CREATE TABLE IF NOT EXISTS offer_candidates (
                     catalog_product_key TEXT PRIMARY KEY,
@@ -187,6 +213,21 @@ class Database:
                 )
                 """,
                 """CREATE INDEX IF NOT EXISTS idx_admin_monitored_products_active ON admin_monitored_products(active, group_key)""",
+                """
+                CREATE TABLE IF NOT EXISTS auvello_categories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    group_key TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL,
+                    whatsapp_group_id TEXT,
+                    search_term TEXT,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    public_visible INTEGER NOT NULL DEFAULT 1,
+                    mirror_to_general INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """,
+                """CREATE INDEX IF NOT EXISTS idx_auvello_categories_active ON auvello_categories(active, public_visible)""",
                 """
                 CREATE TABLE IF NOT EXISTS offer_candidates (
                     catalog_product_key TEXT PRIMARY KEY,
@@ -333,6 +374,77 @@ class Database:
                     sent_at,
                 ),
             )
+
+    def _seed_default_categories(self) -> None:
+        """Garante as seis categorias históricas sem sobrescrever ajustes do Admin."""
+        p = self._ph
+        sql = f"""
+            INSERT INTO auvello_categories (
+                group_key, name, whatsapp_group_id, search_term, active,
+                public_visible, mirror_to_general, created_at, updated_at
+            ) VALUES ({p}, {p}, {p}, NULL, {p}, {p}, {p}, {p}, {p})
+            ON CONFLICT(group_key) DO NOTHING
+        """
+        now = datetime.now(timezone.utc)
+        stored_now = now if self.is_postgres else now.isoformat()
+        truthy = True if self.is_postgres else 1
+        with self._connect() as conn:
+            for group_key, name in DEFAULT_CATEGORY_NAMES.items():
+                group_id = settings.group_ids.get(group_key) or None
+                conn.execute(sql, (
+                    group_key, name, group_id, truthy, truthy, truthy,
+                    stored_now, stored_now,
+                ))
+
+    def active_categories(self) -> list[dict[str, Any]]:
+        """Categorias específicas gerenciadas pelo Admin."""
+        p = self._ph
+        active_value = True if self.is_postgres else 1
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""SELECT id, group_key, name, whatsapp_group_id, search_term,
+                           active, public_visible, mirror_to_general, created_at, updated_at
+                    FROM auvello_categories
+                    WHERE active = {p}
+                    ORDER BY name ASC""",
+                (active_value,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def active_search_categories(self) -> list[dict[str, str]]:
+        """Categorias com termo próprio de descoberta automática."""
+        return [
+            {
+                "group_key": str(row["group_key"]),
+                "name": str(row["name"]),
+                "search_term": str(row["search_term"] or "").strip(),
+            }
+            for row in self.active_categories()
+            if str(row.get("search_term") or "").strip()
+        ]
+
+    def category_group_id(self, group_key: str) -> str | None:
+        """Resolve o JID do WhatsApp salvo no Admin, com fallback para .env."""
+        p = self._ph
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT whatsapp_group_id FROM auvello_categories WHERE group_key = {p} AND active = {p} LIMIT 1",
+                (group_key, True if self.is_postgres else 1),
+            ).fetchone()
+        if row and row["whatsapp_group_id"]:
+            return str(row["whatsapp_group_id"]).strip() or None
+        return settings.group_ids.get(group_key) or None
+
+    def category_mirrors_to_general(self, group_key: str) -> bool:
+        p = self._ph
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT mirror_to_general FROM auvello_categories WHERE group_key = {p} LIMIT 1",
+                (group_key,),
+            ).fetchone()
+        if row is None:
+            return True
+        return bool(row["mirror_to_general"])
 
     def upsert_offer_candidates(self, candidates: list[dict[str, Any]]) -> int:
         """Atualiza o cache persistente de candidatos elegíveis.

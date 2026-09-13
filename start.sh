@@ -48,7 +48,7 @@ if [[ "$READY" != "1" ]]; then
 fi
 
 echo "[cloud] WhatsApp Service HTTP pronto."
-echo "[cloud] Iniciando Auvello Python (CHECK_INTERVAL_MINUTES=${CHECK_INTERVAL_MINUTES:-30})..."
+echo "[cloud] Iniciando Auvello Python (Descoberta=${DISCOVERY_INTERVAL_MINUTES:-10}m | Especificos=${SPECIFIC_GROUP_INTERVAL_MINUTES:-10}m | Geral=${GENERAL_GROUP_INTERVAL_MINUTES:-5}m)..."
 python3 main.py &
 PY_PID=$!
 

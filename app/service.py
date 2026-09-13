@@ -306,7 +306,10 @@ class AuvelloService:
 
             # Regra Auvello: específico -> Geral imediatamente, independente
             # do relógio de 5 minutos. O inverso nunca acontece.
-            if not self._message_limit_reached() and self.db.can_notify(product, GENERAL_GROUP):
+            mirror_enabled = self.db.category_mirrors_to_general(group)
+            if not mirror_enabled:
+                print(f"[espelho] desativado para {group}: {product.name}")
+            elif not self._message_limit_reached() and self.db.can_notify(product, GENERAL_GROUP):
                 if self._queued_send(GENERAL_GROUP, message, product.picture):
                     self.db.mark_notified(product, GENERAL_GROUP)
                     print(f"[espelho] {group} -> geral: {product.name}")
@@ -343,7 +346,13 @@ class AuvelloService:
             if wait > 0:
                 print(f"[fila] aguardando {wait:.1f}s para proximo envio")
                 time.sleep(wait)
-        ok = self.whatsapp.send(group, message, image_url=image_url)
+        group_id = None if group == GENERAL_GROUP else self.db.category_group_id(group)
+        ok = self.whatsapp.send(
+            group,
+            message,
+            image_url=image_url,
+            group_id_override=group_id,
+        )
         self._last_send_at = time.monotonic()
         if ok:
             self._messages_sent_this_cycle += 1

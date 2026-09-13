@@ -7,8 +7,14 @@ from .config import settings
 
 
 class WhatsAppClient:
-    def send(self, group_key: str, message: str, image_url: str | None = None) -> bool:
-        group_id = settings.group_ids.get(group_key)
+    def send(
+        self,
+        group_key: str,
+        message: str,
+        image_url: str | None = None,
+        group_id_override: str | None = None,
+    ) -> bool:
+        group_id = group_id_override or settings.group_ids.get(group_key)
         if not group_id:
             print(f"[whatsapp] grupo nao configurado: {group_key}")
             return False

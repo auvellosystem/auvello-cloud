@@ -47,6 +47,10 @@ class Discovery:
         if getattr(settings, "discovery_trends", True):
             self._from_trends(offers)
 
+        # Categorias criadas no Admin podem ter um termo próprio de busca.
+        # Isso permite criar um novo grupo/categoria sem alterar o código.
+        self._from_dynamic_categories(offers)
+
         # Pedidos aprovados da comunidade são interesses/termos de busca.
         # O link enviado pelo membro é só referência; não fixa aquele anúncio.
         self._from_community(offers)
@@ -201,6 +205,47 @@ class Discovery:
                 )
             except Exception as exc:
                 print(f"[watchlist/id] {code!r}: {exc}")
+
+    def _from_dynamic_categories(self, out: dict[str, Product]) -> None:
+        """Descobre ofertas para categorias criadas/gerenciadas no Admin.
+
+        Somente categorias com ``search_term`` preenchido geram chamadas extras.
+        Os resultados recebem ``forced_group`` para irem ao grupo cadastrado.
+        """
+        if self.db is None:
+            return
+        try:
+            categories = self.db.active_search_categories()
+        except Exception as exc:
+            print(f"[categorias] erro lendo categorias: {exc}")
+            return
+        if not categories:
+            return
+
+        min_discount = max(1, int(getattr(settings, "min_discount_percent", 15)))
+        for entry in categories:
+            group_key = (entry.get("group_key") or "").strip()
+            search_term = (entry.get("search_term") or "").strip()
+            name = (entry.get("name") or group_key).strip()
+            if not group_key or not search_term:
+                continue
+            try:
+                results = self.ml.search_products(q=search_term)
+                found = 0
+                for result in results:
+                    offers = self.ml.offers_from_search_result(
+                        result, discounted_only=True, min_discount=min_discount
+                    )
+                    for offer in offers:
+                        offer.forced_group = group_key
+                        offer.discovery_source = "admin_category"
+                    found += self._add_many(out, offers)
+                print(
+                    f"[categorias] {name!r} ({search_term!r}) -> {group_key}: "
+                    f"{len(results)} PRODUCTs, {found} ofertas >= {min_discount}%"
+                )
+            except Exception as exc:
+                print(f"[categorias] {name!r}: {exc}")
 
     def _from_community(self, out: dict[str, Product]) -> None:
         """
