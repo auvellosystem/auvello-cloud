@@ -14,7 +14,7 @@ COPY requirements.txt ./requirements.txt
 RUN python3 -m pip install --break-system-packages --no-cache-dir -r requirements.txt
 
 COPY whatsapp-service/package*.json ./whatsapp-service/
-RUN cd whatsapp-service && npm ci --omit=dev
+RUN cd whatsapp-service && npm install --omit=dev
 
 COPY . .
 RUN chmod +x /app/start.sh
