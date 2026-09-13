@@ -109,6 +109,27 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_admin_monitored_products_active
                 ON admin_monitored_products(active, group_key)
                 """,
+                """
+                CREATE TABLE IF NOT EXISTS community_requests (
+                    id BIGSERIAL PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    whatsapp TEXT NOT NULL,
+                    reference_url TEXT NOT NULL,
+                    reference_product_id TEXT,
+                    desired_item TEXT NOT NULL,
+                    suggested_group_key TEXT NOT NULL,
+                    approved_group_key TEXT,
+                    approved_search_term TEXT,
+                    notes TEXT,
+                    status TEXT NOT NULL DEFAULT 'pendente',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """,
+                """
+                CREATE INDEX IF NOT EXISTS idx_community_requests_status
+                ON community_requests(status, approved_group_key, created_at)
+                """,
             ]
         else:
             statements = [
@@ -169,6 +190,27 @@ class Database:
                 """
                 CREATE INDEX IF NOT EXISTS idx_admin_monitored_products_active
                 ON admin_monitored_products(active, group_key)
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS community_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    whatsapp TEXT NOT NULL,
+                    reference_url TEXT NOT NULL,
+                    reference_product_id TEXT,
+                    desired_item TEXT NOT NULL,
+                    suggested_group_key TEXT NOT NULL,
+                    approved_group_key TEXT,
+                    approved_search_term TEXT,
+                    notes TEXT,
+                    status TEXT NOT NULL DEFAULT 'pendente',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """,
+                """
+                CREATE INDEX IF NOT EXISTS idx_community_requests_status
+                ON community_requests(status, approved_group_key, created_at)
                 """,
             ]
 
@@ -292,3 +334,29 @@ class Database:
             {"product_id": str(row["product_id"]), "group_key": str(row["group_key"])}
             for row in rows
         ]
+    def approved_community_requests(self) -> list[dict[str, str]]:
+        """Interesses da comunidade já aprovados pelo dev.
+
+        Cada registro representa um termo/categoria de busca, não um anúncio
+        específico. O link enviado pelo membro é apenas referência para análise.
+        """
+        p = self._ph
+        sql = f"""
+            SELECT id, approved_search_term, approved_group_key
+            FROM community_requests
+            WHERE status = {p}
+              AND approved_search_term IS NOT NULL
+              AND approved_group_key IS NOT NULL
+            ORDER BY id ASC
+        """
+        with self._connect() as conn:
+            rows = conn.execute(sql, ("aprovado",)).fetchall()
+        return [
+            {
+                "id": str(row["id"]),
+                "search_term": str(row["approved_search_term"]),
+                "group_key": str(row["approved_group_key"]),
+            }
+            for row in rows
+        ]
+

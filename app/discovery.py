@@ -47,6 +47,10 @@ class Discovery:
         if getattr(settings, "discovery_trends", True):
             self._from_trends(offers)
 
+        # Pedidos aprovados da comunidade são interesses/termos de busca.
+        # O link enviado pelo membro é só referência; não fixa aquele anúncio.
+        self._from_community(offers)
+
         # Produtos fixados pelo dev entram por ultimo para que o grupo escolhido
         # no Admin prevaleca se a mesma oferta tambem vier de outra fonte.
         # Continua sendo uma fonte aditiva: nao substitui Highlights/Watchlist/Trends.
@@ -197,6 +201,57 @@ class Discovery:
                 )
             except Exception as exc:
                 print(f"[watchlist/id] {code!r}: {exc}")
+
+    def _from_community(self, out: dict[str, Product]) -> None:
+        """
+        Usa apenas pedidos que o dev aprovou no Admin.
+
+        Cada pedido aprovado vira um TERMO DE BUSCA recorrente e associado ao
+        grupo validado pelo dev. O PRODUCT_ID do link de referência não é
+        monitorado diretamente por esta fonte.
+        """
+        if self.db is None:
+            return
+
+        try:
+            requests = self.db.approved_community_requests()
+        except Exception as exc:
+            print(f"[community] erro lendo pedidos aprovados: {exc}")
+            return
+
+        if not requests:
+            print("[community] nenhum pedido aprovado")
+            return
+
+        min_discount = max(1, int(getattr(settings, "min_discount_percent", 15)))
+
+        for entry in requests:
+            request_id = entry.get("id")
+            search_term = (entry.get("search_term") or "").strip()
+            group_key = entry.get("group_key")
+            if not search_term or not group_key:
+                continue
+
+            try:
+                results = self.ml.search_products(q=search_term)
+                found = 0
+                for result in results:
+                    offers = self.ml.offers_from_search_result(
+                        result,
+                        discounted_only=True,
+                        min_discount=min_discount,
+                    )
+                    for offer in offers:
+                        offer.forced_group = group_key
+                        offer.discovery_source = "community"
+                    found += self._add_many(out, offers)
+
+                print(
+                    f"[community] #{request_id} {search_term!r} -> {group_key}: "
+                    f"{len(results)} PRODUCTs, {found} ofertas >= {min_discount}%"
+                )
+            except Exception as exc:
+                print(f"[community] #{request_id} {search_term!r}: {exc}")
 
     def _from_admin(self, out: dict[str, Product]) -> None:
         """
