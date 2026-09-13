@@ -1,0 +1,10 @@
+.env
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.db
+token_store.json
+whatsapp-service/node_modules/
+whatsapp-service/auth_info/

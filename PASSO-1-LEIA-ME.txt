@@ -1,0 +1,32 @@
+AUVello V8 - PASSO 1: PREPARACAO PARA NUVEM / RENDER
+=====================================================
+
+O que foi feito nesta etapa
+---------------------------
+1. Mantidas as regras atuais do Auvello (Product Items, Score, Slots, controles e imagem).
+2. CHECK_INTERVAL_MINUTES do exemplo alterado para 30 minutos.
+3. Criado start.sh para iniciar Node/Baileys + Python no MESMO servico.
+4. Criado Dockerfile para garantir Node 22 + Python no mesmo ambiente Linux.
+5. Criado .dockerignore para NAO enviar .env, banco local, token_store ou auth_info para a imagem.
+6. .gitignore reforcado para nao publicar segredos/sessao/banco no GitHub.
+7. O start.sh ajusta WHATSAPP_SERVICE_URL automaticamente para a porta do Render.
+
+O que NAO foi feito ainda
+-------------------------
+- O banco continua SQLite. A migracao para Neon/PostgreSQL e o PASSO 2.
+- A sessao auth_info continua local. Persistencia do WhatsApp sera tratada no PASSO 3.
+- Nada foi publicado no Render ainda.
+- Nenhum segredo deve ser colocado neste ZIP ou no GitHub.
+
+Como testar localmente sem Docker
+---------------------------------
+Continue usando exatamente seu fluxo atual. Garanta no .env:
+
+CHECK_INTERVAL_MINUTES=30
+MAX_MESSAGES_PER_RUN=5
+
+O start.sh/Dockerfile existem para a etapa de nuvem e nao sao obrigatorios para seu teste Windows atual.
+
+ATENCAO
+-------
+Nao copie auth_info, .env, token_store.json ou banco .db para um repositorio publico.

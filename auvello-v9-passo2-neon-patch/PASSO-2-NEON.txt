@@ -1,0 +1,30 @@
+AUVELLO CLOUD - PASSO 2: NEON / POSTGRESQL
+
+Arquivos alterados neste passo:
+- app/database.py
+- app/config.py
+- requirements.txt
+
+O que mudou:
+- Se DATABASE_URL estiver preenchida no .env, o Auvello usa PostgreSQL/Neon.
+- Se DATABASE_URL estiver vazia, o Auvello continua podendo usar SQLite local.
+- As tabelas sao criadas automaticamente na primeira execucao.
+- Historico de preco continua por item/oferta.
+- Cooldown/notificacao continua por PRODUCT_ID.
+- Score, slots, descoberta, afiliado e WhatsApp nao foram alterados.
+
+No seu .env:
+DATABASE_URL=postgresql://...string completa fornecida pelo Neon...
+
+NAO coloque a URL do Neon neste arquivo e NAO envie o .env para GitHub.
+
+Teste local:
+1. Abra um terminal na raiz do Auvello-Cloud.
+2. Instale/atualize dependencias:
+   python -m pip install -r requirements.txt
+3. Rode uma rodada:
+   python main.py --once
+4. No inicio, procure a linha:
+   [database] usando PostgreSQL/Neon
+
+Se aparecer essa linha, a DATABASE_URL foi lida corretamente.
