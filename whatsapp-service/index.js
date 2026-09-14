@@ -180,12 +180,25 @@ function adminAuth(req, res, next) {
 
 function extractProductId(value) {
   const text = String(value || "").trim().toUpperCase();
-  const direct = text.match(/^MLB\d+$/);
-  if (direct) return direct[0];
-  const fromCatalogUrl = text.match(/\/P\/(MLB\d+)/);
-  if (fromCatalogUrl) return fromCatalogUrl[1];
+
+  // PRODUCT_IDs do Mercado Livre podem aparecer como MLB... ou MLBU...
+  // Em URLs /up/MLBU... o catálogo deve ter prioridade sobre ?item_id=MLB...
+  const direct = text.match(/^(MLBU?\d+)$/);
+  if (direct) return direct[1];
+
+  const fromProductUrl = text.match(/\/(?:UP|P)\/(MLBU?\d+)/);
+  if (fromProductUrl) return fromProductUrl[1];
+
+  const catalogAnywhere = text.match(/\b(MLBU\d{5,})\b/);
+  if (catalogAnywhere) return catalogAnywhere[1];
+
   const anywhere = text.match(/\b(MLB\d{5,})\b/);
   return anywhere ? anywhere[1] : null;
+}
+
+function looksLikeUrl(value) {
+  const text = String(value || "").trim();
+  return /^https?:\/\//i.test(text);
 }
 
 function normalizeText(value, maxLength = 300) {
@@ -326,7 +339,7 @@ async function loadProducts(){try{const d=await api('/api/admin/products');const
 async function addProduct(){const value=$('product').value.trim(),groupKey=$('group').value;if(!value||!groupKey)return;try{await api('/api/admin/products',{method:'POST',body:JSON.stringify({value,groupKey})});$('product').value='';$('message').textContent='Produto adicionado.';loadProducts();}catch(e){$('message').textContent=e.message;}}
 const statusInfo={pendente:'PENDENTE',em_analise:'EM ANÁLISE',aprovado:'APROVADO',rejeitado:'REJEITADO',precisa_contato:'PRECISA CONTATO'};function digits(v){const d=String(v||'').replace(/\D/g,'');return(d.length===10||d.length===11)?'55'+d:d;}
 async function loadRequests(){try{const d=await api('/api/admin/community-requests');const M=catMap();if(!d.requests.length){$('requests').innerHTML='<div class="empty">Nenhuma solicitação.</div>';return;}$('requests').innerHTML=d.requests.map(r=>{const group=r.approved_group_key||r.suggested_group_key;const search=r.approved_search_term||r.desired_item||'';const ref=r.reference_url?'<div class="note"><strong>Link:</strong> <a target="_blank" style="color:#72eda0" href="'+esc(r.reference_url)+'">abrir referência</a></div>':'';const pedido=r.desired_item?'<div class="note"><strong>Pedido:</strong> '+esc(r.desired_item)+'</div>':'<div class="note"><strong>Pedido:</strong> somente link de referência</div>';return '<div class="request" data-request="'+r.id+'"><div class="request-head"><div><h3>#'+r.id+' — '+esc(r.name)+'</h3><div class="meta">'+fmtDate(r.created_at)+' · <a style="color:#72eda0" target="_blank" href="https://wa.me/'+esc(digits(r.whatsapp))+'">'+esc(r.whatsapp)+'</a></div></div><span class="pill">'+esc(statusInfo[r.status]||r.status)+'</span></div>'+pedido+ref+'<div class="note"><strong>Categoria sugerida:</strong> '+esc(M[r.suggested_group_key]||r.suggested_group_key)+'</div>'+(r.notes?'<div class="note"><strong>Observação:</strong> '+esc(r.notes)+'</div>':'')+'<div class="request-grid"><div><label>Termo que o Auvello pesquisará</label><input data-f="search" maxlength="180" value="'+esc(search)+'" placeholder="Digite manualmente se o usuário enviou só o link"></div><div><label>Categoria validada</label><select data-f="group">'+activeOptions(group)+'</select></div></div><div class="community-actions"><button class="secondary" data-status="em_analise">Em análise</button><button data-status="aprovado">Aprovar</button><button class="secondary" data-status="precisa_contato">Precisa contato</button><button class="danger" data-status="rejeitado">Rejeitar</button></div></div>';}).join('');$('requests').querySelectorAll('[data-request]').forEach(card=>card.querySelectorAll('[data-status]').forEach(b=>b.onclick=()=>updateRequest(card,b.dataset.status)));}catch(e){$('requests').innerHTML='<div class="empty">Erro: '+esc(e.message)+'</div>';}}
-async function updateRequest(card,status){const search=card.querySelector('[data-f="search"]').value.trim(),groupKey=card.querySelector('[data-f="group"]').value;if(status==='aprovado'&&!search)return alert('Digite o termo de busca antes de aprovar.');const button=card.querySelector('[data-status="'+status+'"]');const original=button?.textContent;if(button&&status==='aprovado'){button.disabled=true;button.textContent='Consultando...';}try{const d=await api('/api/admin/community-requests/'+card.dataset.request,{method:'PATCH',body:JSON.stringify({status,approvedSearchTerm:search,approvedGroupKey:groupKey})});if(status==='aprovado')showLookup('Consulta após aprovação — '+search,d.lookup,d.lookup_error);await loadRequests();}catch(e){alert(e.message);}finally{if(button){button.disabled=false;if(original)button.textContent=original;}}}
+async function updateRequest(card,status){const search=card.querySelector('[data-f="search"]').value.trim(),groupKey=card.querySelector('[data-f="group"]').value;const button=card.querySelector('[data-status="'+status+'"]');const original=button?.textContent;if(button&&status==='aprovado'){button.disabled=true;button.textContent='Consultando...';}try{const d=await api('/api/admin/community-requests/'+card.dataset.request,{method:'PATCH',body:JSON.stringify({status,approvedSearchTerm:search,approvedGroupKey:groupKey})});if(status==='aprovado')showLookup('Consulta após aprovação — '+search,d.lookup,d.lookup_error);await loadRequests();}catch(e){alert(e.message);}finally{if(button){button.disabled=false;if(original)button.textContent=original;}}}
 $('catAdd').onclick=createCategory;$('add').onclick=addProduct;$('refresh').onclick=loadProducts;$('refreshRequests').onclick=loadRequests;(async()=>{await loadWhatsAppGroups();await loadCategories();await loadProducts();await loadRequests();})();
 </script></body></html>`);
 });
@@ -443,20 +456,47 @@ app.patch("/api/admin/community-requests/:id", adminAuth, async (req,res)=>{
     await ensureAdminTable();
     const current=await adminPool.query("SELECT * FROM community_requests WHERE id=$1 LIMIT 1",[id]);
     if(!current.rows[0])return res.status(404).json({error:"Solicitação não encontrada."});
-    const finalSearch=approvedSearchTerm||current.rows[0].approved_search_term||current.rows[0].desired_item||"";
-    const finalGroup=approvedGroupKey||current.rows[0].approved_group_key||current.rows[0].suggested_group_key;
+
+    const currentRow=current.rows[0];
+    const referenceProductId=extractProductId(currentRow.reference_url)||currentRow.reference_product_id||null;
+    let finalSearch=approvedSearchTerm||currentRow.approved_search_term||currentRow.desired_item||"";
+    const finalGroup=approvedGroupKey||currentRow.approved_group_key||currentRow.suggested_group_key;
     const category=await getCategoryByKey(finalGroup,{activeOnly:true});
-    if(status==='aprovado'&&(!finalSearch||!category))return res.status(400).json({error:"Para aprovar, informe manualmente o termo de busca e uma categoria ativa."});
+
+    let lookup=null;
+    let lookup_error=null;
+
+    // Se o pedido possui link de referência, a consulta imediata é feita pelo
+    // PRODUCT_ID do catálogo (MLBU/MLB), nunca pelo item_id isolado do anúncio.
+    if(status==='aprovado'&&referenceProductId){
+      try{
+        lookup=await runManualLookup({productId:referenceProductId});
+
+        // Pedido só com link (ou URL colada como "termo"):
+        // usa o nome do produto encontrado como termo recorrente.
+        if((!finalSearch||looksLikeUrl(finalSearch))&&lookup?.results?.[0]?.name){
+          finalSearch=normalizeText(lookup.results[0].name,180);
+        }
+
+        console.log(`[manual-lookup] aprovação #${id} PRODUCT ${referenceProductId}: ${lookup.results?.length||0} resultados`);
+      }catch(error){
+        lookup_error=String(error?.message||error);
+        console.error(`[manual-lookup] aprovação #${id} PRODUCT ${referenceProductId}:`,error);
+      }
+    }
+
+    if(status==='aprovado'&&(!finalSearch||!category))return res.status(400).json({error:"Para aprovar, informe um produto/termo válido e uma categoria ativa."});
+
     if(status==='aprovado'){
       const dup=await adminPool.query(`SELECT id FROM community_requests WHERE id<>$1 AND status='aprovado' AND LOWER(TRIM(approved_search_term))=LOWER(TRIM($2)) AND approved_group_key=$3 LIMIT 1`,[id,finalSearch,finalGroup]);
       if(dup.rows[0])return res.status(409).json({error:`Já existe um pedido aprovado com esse mesmo termo e categoria (#${dup.rows[0].id}).`});
     }
-    const {rows}=await adminPool.query(`UPDATE community_requests SET status=$2,approved_search_term=$3,approved_group_key=$4,updated_at=NOW() WHERE id=$1 RETURNING *`,[id,status,finalSearch,finalGroup]);
+
+    const {rows}=await adminPool.query(`UPDATE community_requests SET status=$2,approved_search_term=$3,approved_group_key=$4,reference_product_id=COALESCE($5,reference_product_id),updated_at=NOW() WHERE id=$1 RETURNING *`,[id,status,finalSearch,finalGroup,referenceProductId]);
     console.log(`[community] #${id} -> ${status}${status==='aprovado'?` | ${finalSearch} -> ${finalGroup}`:''}`);
 
-    let lookup=null;
-    let lookup_error=null;
-    if(status==='aprovado'){
+    // Sem link de referência, mantém o comportamento por termo.
+    if(status==='aprovado'&&!referenceProductId){
       try{
         lookup=await runManualLookup({term:finalSearch});
         console.log(`[manual-lookup] aprovação #${id} ${finalSearch}: ${lookup.results?.length||0} resultados`);
@@ -465,6 +505,7 @@ app.patch("/api/admin/community-requests/:id", adminAuth, async (req,res)=>{
         console.error(`[manual-lookup] aprovação #${id}:`,error);
       }
     }
+
     res.json({request:rows[0],lookup,lookup_error});
   }catch(error){
     console.error("[admin/community] update:",error);
