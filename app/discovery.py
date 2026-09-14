@@ -10,6 +10,28 @@ from .config import settings
 from .database import Database
 
 
+
+
+def _split_search_terms(raw: str, max_terms: int = 15) -> list[str]:
+    """Aceita uma busca simples ou vários termos separados por vírgula,
+    ponto e vírgula ou quebra de linha. Remove duplicados preservando ordem.
+    """
+    if not raw:
+        return []
+    normalized = str(raw).replace('\r\n', '\n').replace('\r', '\n').replace(';', '\n').replace(',', '\n')
+    seen: set[str] = set()
+    terms: list[str] = []
+    for part in normalized.split('\n'):
+        term = ' '.join(part.split()).strip()
+        key = term.casefold()
+        if not term or key in seen:
+            continue
+        seen.add(key)
+        terms.append(term)
+        if len(terms) >= max_terms:
+            break
+    return terms
+
 AUVELLO_ROOTS = {
     "eletronicos_tecnologia": ["MLB1000", "MLB1648"],
     "moda_vestuario": ["MLB1430"],
@@ -225,27 +247,41 @@ class Discovery:
         min_discount = max(1, int(getattr(settings, "min_discount_percent", 15)))
         for entry in categories:
             group_key = (entry.get("group_key") or "").strip()
-            search_term = (entry.get("search_term") or "").strip()
+            raw_search = (entry.get("search_term") or "").strip()
             name = (entry.get("name") or group_key).strip()
-            if not group_key or not search_term:
+            terms = _split_search_terms(raw_search)
+            if not group_key or not terms:
                 continue
-            try:
-                results = self.ml.search_products(q=search_term)
-                found = 0
-                for result in results:
-                    offers = self.ml.offers_from_search_result(
-                        result, discounted_only=True, min_discount=min_discount
+
+            total_products = 0
+            total_found = 0
+            successful_terms = 0
+            for search_term in terms:
+                try:
+                    results = self.ml.search_products(q=search_term)
+                    found = 0
+                    for result in results:
+                        offers = self.ml.offers_from_search_result(
+                            result, discounted_only=True, min_discount=min_discount
+                        )
+                        for offer in offers:
+                            offer.forced_group = group_key
+                            offer.discovery_source = "admin_category"
+                        found += self._add_many(out, offers)
+                    successful_terms += 1
+                    total_products += len(results)
+                    total_found += found
+                    print(
+                        f"[categorias] {name!r} termo={search_term!r} -> {group_key}: "
+                        f"{len(results)} PRODUCTs, {found} ofertas >= {min_discount}%"
                     )
-                    for offer in offers:
-                        offer.forced_group = group_key
-                        offer.discovery_source = "admin_category"
-                    found += self._add_many(out, offers)
-                print(
-                    f"[categorias] {name!r} ({search_term!r}) -> {group_key}: "
-                    f"{len(results)} PRODUCTs, {found} ofertas >= {min_discount}%"
-                )
-            except Exception as exc:
-                print(f"[categorias] {name!r}: {exc}")
+                except Exception as exc:
+                    print(f"[categorias] {name!r} termo={search_term!r}: {exc}")
+
+            print(
+                f"[categorias] {name!r}: {successful_terms}/{len(terms)} termos processados, "
+                f"{total_products} PRODUCTs consultados, {total_found} ofertas adicionadas"
+            )
 
     def _from_community(self, out: dict[str, Product]) -> None:
         """
