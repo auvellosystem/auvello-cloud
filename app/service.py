@@ -167,18 +167,31 @@ class AuvelloService:
         # O Geral compara todas as categorias no mesmo pool. O score é
         # recalculado globalmente para que as melhores oportunidades concorram.
         self._assign_scores(available)
-        available.sort(
+        strong = [
+            c for c in available
+            if self._is_strong_for_general(c, settings.general_routine_min_score)
+        ]
+        strong.sort(
             key=lambda c: (c.score, c.effective_discount, c.savings),
             reverse=True,
         )
-        selected = available[: settings.max_products_general]
+
+        remaining_hour = self._general_remaining_hourly_capacity()
+        selected = strong[: min(settings.max_products_general, remaining_hour)]
         print(
-            f"[geral] {len(candidates)} candidatos no cache, {len(available)} fora do cooldown -> "
-            f"{len(selected)} selecionados"
+            f"[geral] {len(candidates)} candidatos no cache, {len(available)} fora do cooldown, "
+            f"{len(strong)} fortes -> {len(selected)} selecionados | "
+            f"cota hora restante={remaining_hour}"
         )
 
+        if remaining_hour <= 0:
+            print(
+                f"[geral] teto de {settings.general_max_messages_per_hour} mensagens/hora atingido; "
+                "rotina sem envio"
+            )
+
         for candidate in selected:
-            if self._message_limit_reached():
+            if self._message_limit_reached() or self._general_hourly_limit_reached():
                 break
             try:
                 self._publish_general(candidate, reason="rotina")
@@ -286,6 +299,28 @@ class AuvelloService:
 
         return chosen[: settings.max_products_per_group]
 
+    @staticmethod
+    def _is_strong_for_general(candidate: Candidate, min_score: float) -> bool:
+        """Critério premium do Geral: basta cumprir um dos três sinais."""
+        return (
+            candidate.effective_discount >= settings.general_min_discount_percent
+            or candidate.savings >= settings.general_min_savings_brl
+            or candidate.score >= min_score
+        )
+
+    def _general_messages_last_hour(self) -> int:
+        return self.db.count_group_notifications_since(GENERAL_GROUP, minutes=60)
+
+    def _general_remaining_hourly_capacity(self) -> int:
+        limit = settings.general_max_messages_per_hour
+        if limit <= 0:
+            return 10**9
+        return max(0, limit - self._general_messages_last_hour())
+
+    def _general_hourly_limit_reached(self) -> bool:
+        limit = settings.general_max_messages_per_hour
+        return limit > 0 and self._general_messages_last_hour() >= limit
+
     def _publish_specific_and_mirror(self, candidate: Candidate) -> None:
         product, group = candidate.product, candidate.group
         if not self.db.can_notify(product, group):
@@ -307,8 +342,20 @@ class AuvelloService:
             # Regra Auvello: específico -> Geral imediatamente, independente
             # do relógio de 5 minutos. O inverso nunca acontece.
             mirror_enabled = self.db.category_mirrors_to_general(group)
+            strong_for_general = self._is_strong_for_general(candidate, settings.general_min_score)
             if not mirror_enabled:
                 print(f"[espelho] desativado para {group}: {product.name}")
+            elif not strong_for_general:
+                print(
+                    f"[espelho] oferta nao forte o suficiente para o Geral: {product.name} | "
+                    f"desc={candidate.effective_discount:.1f}% | economia=R$ {candidate.savings:.2f} | "
+                    f"score={candidate.score:.1f}"
+                )
+            elif self._general_hourly_limit_reached():
+                print(
+                    f"[espelho] teto do Geral atingido ({settings.general_max_messages_per_hour}/hora): "
+                    f"{product.name}"
+                )
             elif not self._message_limit_reached() and self.db.can_notify(product, GENERAL_GROUP):
                 if self._queued_send(GENERAL_GROUP, message, product.picture):
                     self.db.mark_notified(product, GENERAL_GROUP)

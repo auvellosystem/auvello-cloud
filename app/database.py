@@ -375,6 +375,29 @@ class Database:
                 ),
             )
 
+    def count_group_notifications_since(self, group_key: str, minutes: int = 60) -> int:
+        """Conta envios confirmados a um grupo dentro de uma janela móvel.
+
+        É usado como teto de volume do Geral. Como mark_notified só é chamado
+        após o WhatsApp confirmar o envio, falhas não consomem a cota.
+        """
+        since = datetime.now(timezone.utc) - timedelta(minutes=max(1, minutes))
+        if not self.is_postgres:
+            since = since.isoformat()
+
+        p = self._ph
+        sql = f"""
+            SELECT COUNT(*) AS total
+            FROM product_notifications
+            WHERE group_key = {p}
+              AND sent_at >= {p}
+        """
+        with self._connect() as conn:
+            row = conn.execute(sql, (group_key, since)).fetchone()
+        if not row:
+            return 0
+        return int(row["total"] or 0)
+
     def _seed_default_categories(self) -> None:
         """Garante as seis categorias históricas sem sobrescrever ajustes do Admin."""
         p = self._ph

@@ -51,7 +51,7 @@ class Settings:
     # uma nova busca no Mercado Livre a cada 5 minutos.
     discovery_interval_minutes: int = _int("DISCOVERY_INTERVAL_MINUTES", 10)
     specific_group_interval_minutes: int = _int("SPECIFIC_GROUP_INTERVAL_MINUTES", 10)
-    general_group_interval_minutes: int = _int("GENERAL_GROUP_INTERVAL_MINUTES", 5)
+    general_group_interval_minutes: int = _int("GENERAL_GROUP_INTERVAL_MINUTES", 15)
     candidate_cache_ttl_minutes: int = _int("CANDIDATE_CACHE_TTL_MINUTES", 30)
 
     # Controles de publicação/WhatsApp.
@@ -63,7 +63,17 @@ class Settings:
     # específico também pode ser espelhado no Geral, o teto precisa comportar
     # os dois destinos. Use 0 para desabilitar o airbag.
     max_messages_per_cycle: int = _int("MAX_MESSAGES_PER_CYCLE", 70)
-    max_products_general: int = _int("MAX_PRODUCTS_GENERAL", 5)
+    max_products_general: int = _int("MAX_PRODUCTS_GENERAL", 2)
+
+    # O grupo Geral é mais seletivo que os grupos específicos.
+    # Espelho: uma oferta específica só entra no Geral quando cumprir pelo
+    # menos um destes critérios. A rotina própria do Geral usa um score
+    # mínimo separado, ligeiramente menor, mas continua sob o teto por hora.
+    general_min_discount_percent: float = _float("GENERAL_MIN_DISCOUNT_PERCENT", 25)
+    general_min_savings_brl: float = _float("GENERAL_MIN_SAVINGS_BRL", 150)
+    general_min_score: float = _float("GENERAL_MIN_SCORE", 70)
+    general_routine_min_score: float = _float("GENERAL_ROUTINE_MIN_SCORE", 65)
+    general_max_messages_per_hour: int = _int("GENERAL_MAX_MESSAGES_PER_HOUR", 8)
 
     # Auvello Score: desconto + economia em reais + acessibilidade.
     score_discount_weight: float = _float("SCORE_DISCOUNT_WEIGHT", 0.45)
@@ -71,7 +81,7 @@ class Settings:
     score_accessibility_weight: float = _float("SCORE_ACCESSIBILITY_WEIGHT", 0.25)
 
     # Slots de oportunidade por grupo (máximo 5 produtos).
-    max_products_per_group: int = _int("MAX_PRODUCTS_PER_GROUP", 5)
+    max_products_per_group: int = _int("MAX_PRODUCTS_PER_GROUP", 3)
     slot_top_discount_count: int = _int("SLOT_TOP_DISCOUNT_COUNT", 2)
     slot_min_strong_discount: float = _float("SLOT_MIN_STRONG_DISCOUNT", 25)
     slot_min_savings_reais: float = _float("SLOT_MIN_SAVINGS_REAIS", 100)
