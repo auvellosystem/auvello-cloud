@@ -111,6 +111,10 @@ async function ensureAdminTable() {
     )
   `);
   await adminPool.query(`CREATE INDEX IF NOT EXISTS idx_community_requests_status ON community_requests(status, approved_group_key, created_at)`);
+  await adminPool.query(`ALTER TABLE community_requests ADD COLUMN IF NOT EXISTS instant_lookup_count INTEGER NOT NULL DEFAULT 0`);
+  await adminPool.query(`ALTER TABLE community_requests ADD COLUMN IF NOT EXISTS instant_response_status TEXT`);
+  await adminPool.query(`ALTER TABLE community_requests ADD COLUMN IF NOT EXISTS instant_response_error TEXT`);
+  await adminPool.query(`ALTER TABLE community_requests ADD COLUMN IF NOT EXISTS instant_response_at TIMESTAMPTZ`);
 
   const ids = builtinGroupIds();
   for (const [groupKey, name] of Object.entries(BUILTIN_CATEGORIES)) {
@@ -224,6 +228,55 @@ function normalizeText(value, maxLength = 300) {
   return String(value || "").trim().replace(/\s+/g, " ").slice(0, maxLength);
 }
 
+function personalWhatsappDigits(value) {
+  let digits = String(value || "").replace(/\D/g, "");
+  if ((digits.length === 10 || digits.length === 11) && !digits.startsWith("55")) digits = `55${digits}`;
+  return digits.slice(0, 15);
+}
+
+async function resolvePersonalWhatsappJid(value) {
+  if (!ready || !sock) throw new Error("WhatsApp do Auvello ainda não está conectado.");
+  const digits = personalWhatsappDigits(value);
+  if (digits.length < 12 || digits.length > 15) throw new Error("Número de WhatsApp inválido.");
+  try {
+    const checks = await sock.onWhatsApp(digits);
+    const found = Array.isArray(checks) ? checks.find(item => item?.exists && item?.jid) : null;
+    if (found?.jid) return found.jid;
+  } catch (error) {
+    console.log("[community/private] onWhatsApp:", String(error?.message || error));
+  }
+  return `${digits}@s.whatsapp.net`;
+}
+
+async function sendLookupToCustomer({ whatsapp, name, term, lookup }) {
+  const results = Array.isArray(lookup?.results) ? lookup.results.slice(0, 3) : [];
+  const sendable = results.filter(result => String(result?.url || "").startsWith("http"));
+  const jid = await resolvePersonalWhatsappJid(whatsapp);
+  const safeName = normalizeText(name, 80) || "cliente";
+  const safeTerm = normalizeText(term, 180) || "produto solicitado";
+
+  if (!results.length) {
+    await sock.sendMessage(jid, { text: `Olá, *${safeName}*! 🔎\n\nA Auvello pesquisou *${safeTerm}*, mas não encontrou uma oferta relevante agora.\n\nSeu pedido foi registrado e ficará pendente para análise.` });
+    return { sent: 0, status: "sem_resultado", jid };
+  }
+  if (!sendable.length) {
+    await sock.sendMessage(jid, { text: `Olá, *${safeName}*! 🔎\n\nA Auvello encontrou resultados para *${safeTerm}*, mas não conseguiu gerar links de afiliado seguros neste momento.\n\nSeu pedido foi registrado e ficará pendente para análise.` });
+    return { sent: 0, status: "sem_link_afiliado", jid };
+  }
+
+  await sock.sendMessage(jid, { text: `Olá, *${safeName}*! 🔎\n\nA Auvello encontrou ${sendable.length} oferta(s) para *${safeTerm}*:` });
+  let sent = 0;
+  for (const result of sendable) {
+    const message = lookupDispatchMessage(result);
+    const picture = String(result?.picture || "").trim();
+    if (picture) await sock.sendMessage(jid, { image: { url: picture }, caption: message });
+    else await sock.sendMessage(jid, { text: message });
+    sent += 1;
+  }
+  await sock.sendMessage(jid, { text: "✅ Seu pedido também foi registrado no Auvello e ficará pendente para análise." });
+  return { sent, status: "enviado", jid };
+}
+
 function normalizeWhatsapp(value) {
   return String(value || "").replace(/[^0-9+()\-\s]/g, "").trim().slice(0, 30);
 }
@@ -287,10 +340,10 @@ app.get("/pedir-oferta", async (_req, res) => {
 :root{color-scheme:dark;--bg:#090d0b;--panel:#111815;--green:#36e676;--text:#f3f7f4;--muted:#93a69b;--border:#26362e}
 *{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at top,#183023 0,#090d0b 42%);font-family:Inter,Arial,sans-serif;color:var(--text)}.wrap{max-width:760px;margin:0 auto;padding:30px 18px 70px}.brand{display:flex;gap:14px;align-items:center;margin-bottom:24px}.logo{width:52px;height:52px;border-radius:15px;background:linear-gradient(145deg,#48f98a,#168c48);display:grid;place-items:center;color:#07120b;font-size:27px;font-weight:900}.brand h1{margin:0;font-size:25px}.brand p{margin:4px 0 0;color:var(--muted)}.card{background:#111815ee;border:1px solid var(--border);border-radius:20px;padding:22px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.full{grid-column:1/-1}label{display:block;font-size:13px;font-weight:750;margin-bottom:7px}.help{font-size:12px;color:var(--muted);line-height:1.45;margin-top:6px}input,select,textarea,button{width:100%;border-radius:11px;border:1px solid var(--border);font:inherit}input,select,textarea{background:#0c120f;color:var(--text);padding:12px 13px;outline:none}input,select{height:46px}textarea{min-height:92px;resize:vertical}button{height:50px;background:var(--green);color:#06200f;font-weight:900;cursor:pointer;border:none}.notice{padding:14px 15px;border-radius:13px;background:#171b13;border:1px solid #4b4524;color:#e8e2c8;font-size:13px;line-height:1.55}.msg{min-height:22px;margin-top:13px;font-size:14px;color:var(--muted)}.msg.ok{color:var(--green)}.msg.err{color:#ff9090}.honeypot{position:absolute;left:-10000px;opacity:0;pointer-events:none}@media(max-width:650px){.grid{grid-template-columns:1fr}.full{grid-column:auto}}
 </style></head><body><div class="wrap">
-<div class="brand"><div class="logo">A</div><div><h1>Ajude o Auvello a buscar melhor</h1><p>Envie um interesse de oferta para análise.</p></div></div>
+<div class="brand"><div class="logo">A</div><div><h1>Encontre uma oferta com a Auvello</h1><p>Peça um produto e receba os resultados no seu WhatsApp.</p></div></div>
 <div class="card"><div class="grid">
 <div><label for="name">Nome</label><input id="name" maxlength="80" autocomplete="name" placeholder="Seu nome"></div>
-<div><label for="whatsapp">WhatsApp para contato</label><input id="whatsapp" maxlength="30" inputmode="tel" autocomplete="tel" placeholder="(27) 99999-9999"><div class="help"><strong>Usaremos este número apenas se precisarmos esclarecer ou dar retorno sobre sua solicitação.</strong></div></div>
+<div><label for="whatsapp">WhatsApp para receber as ofertas</label><input id="whatsapp" maxlength="30" inputmode="tel" autocomplete="tel" placeholder="(27) 99999-9999"><div class="help"><strong>O Auvello pesquisará agora e enviará os resultados desta solicitação para este número. Seu pedido também ficará pendente para análise.</strong></div></div>
 <div class="full notice"><strong>Informe pelo menos uma das duas opções abaixo:</strong> descreva o que procura <strong>ou</strong> cole um link do Mercado Livre. Você também pode preencher os dois.</div>
 <div class="full"><label for="desiredItem">O que você gostaria que o Auvello buscasse? (opcional se enviar link)</label><input id="desiredItem" maxlength="180" placeholder="Ex.: SSD NVMe 1TB, ração para gatos adultos, Air Fryer 5L"></div>
 <div class="full"><label for="referenceUrl">Link de referência do Mercado Livre (opcional se descrever)</label><input id="referenceUrl" maxlength="2000" inputmode="url" placeholder="https://www.mercadolivre.com.br/..."><div class="help">Se você só tiver o link, pode enviar assim. O Auvello poderá definir manualmente o termo de busca durante a análise.</div></div>
@@ -298,11 +351,11 @@ app.get("/pedir-oferta", async (_req, res) => {
 <div><label for="notes">Observação (opcional)</label><textarea id="notes" maxlength="500" placeholder="Ex.: prefiro pacote de 10 kg ou mais"></textarea></div>
 <div class="honeypot"><input id="company" tabindex="-1" autocomplete="off"></div>
 <div class="full notice"><strong>Importante:</strong> o link é referência. A solicitação não garante o monitoramento daquele anúncio específico. Se aprovada, o Auvello transforma o pedido em um termo de busca associado à categoria correta.</div>
-<div class="full"><button id="send">ENVIAR SOLICITAÇÃO</button><div id="message" class="msg"></div></div>
+<div class="full"><button id="send">BUSCAR MINHA OFERTA</button><div id="message" class="msg"></div></div>
 </div></div></div>
 <script>
 const $=id=>document.getElementById(id);const msg=(t,k='')=>{$('message').textContent=t;$('message').className='msg '+k;};
-$('send').addEventListener('click',async()=>{const payload={name:$('name').value.trim(),whatsapp:$('whatsapp').value.trim(),referenceUrl:$('referenceUrl').value.trim(),desiredItem:$('desiredItem').value.trim(),groupKey:$('groupKey').value,notes:$('notes').value.trim(),company:$('company').value};if(!payload.name||!payload.whatsapp)return msg('Preencha nome e WhatsApp.','err');if(!payload.referenceUrl&&!payload.desiredItem)return msg('Informe o que deseja encontrar ou um link do Mercado Livre.','err');if(!payload.groupKey)return msg('Selecione uma categoria.','err');$('send').disabled=true;msg('Enviando...');try{const r=await fetch('/api/community/requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||'Não foi possível enviar.');msg('Solicitação enviada! Ela ficará pendente até a análise do Auvello.','ok');$('referenceUrl').value='';$('desiredItem').value='';$('notes').value='';}catch(e){msg(e.message,'err');}finally{$('send').disabled=false;}});
+$('send').addEventListener('click',async()=>{const payload={name:$('name').value.trim(),whatsapp:$('whatsapp').value.trim(),referenceUrl:$('referenceUrl').value.trim(),desiredItem:$('desiredItem').value.trim(),groupKey:$('groupKey').value,notes:$('notes').value.trim(),company:$('company').value};if(!payload.name||!payload.whatsapp)return msg('Preencha nome e WhatsApp.','err');if(!payload.referenceUrl&&!payload.desiredItem)return msg('Informe o que deseja encontrar ou um link do Mercado Livre.','err');if(!payload.groupKey)return msg('Selecione uma categoria.','err');$('send').disabled=true;msg('Pesquisando ofertas e preparando o envio para seu WhatsApp...');try{const r=await fetch('/api/community/requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||'Não foi possível enviar.');if(d.instant?.status==='enviado')msg('Pronto! '+(d.instant.sent||0)+' oferta(s) enviada(s) para seu WhatsApp. Seu pedido também ficou pendente para análise.','ok');else if(d.instant?.status==='sem_resultado')msg('Pedido registrado. Não encontramos uma oferta relevante agora; ele ficou pendente para análise.','ok');else if(d.instant?.status==='sem_link_afiliado')msg('Pedido registrado. Encontramos resultados, mas os links não puderam ser preparados agora. O pedido ficou pendente para análise.','ok');else msg('Pedido registrado para análise. Não foi possível entregar a resposta automática no WhatsApp agora.','ok');$('referenceUrl').value='';$('desiredItem').value='';$('notes').value='';}catch(e){msg(e.message,'err');}finally{$('send').disabled=false;}});
 </script></body></html>`);
 });
 
@@ -317,22 +370,60 @@ app.post("/api/community/requests", async (req, res) => {
   const suggestedGroupKey = String(req.body?.groupKey || "").trim();
   const notes = normalizeText(req.body?.notes, 500) || null;
   if (name.length < 2) return res.status(400).json({ error: "Informe seu nome." });
-  if (whatsapp.replace(/\D/g, "").length < 10) return res.status(400).json({ error: "Informe um WhatsApp válido para contato." });
+  if (whatsapp.replace(/\D/g, "").length < 10) return res.status(400).json({ error: "Informe um WhatsApp válido para receber as ofertas." });
   if (!desiredItem && !rawReference) return res.status(400).json({ error: "Informe o que deseja encontrar ou um link do Mercado Livre." });
   if (rawReference && !referenceUrl) return res.status(400).json({ error: "O link informado não é um link válido do Mercado Livre." });
   const category = await getCategoryByKey(suggestedGroupKey, { activeOnly: true }).catch(() => null);
   if (!category || !category.public_visible) return res.status(400).json({ error: "Categoria sugerida inválida." });
+
   try {
+    await ensureAdminTable();
     const referenceProductId = referenceUrl ? extractProductId(referenceUrl) : null;
+    const urlSearchTerm = searchTermFromReferenceUrl(referenceUrl);
+    let instantSearchTerm = desiredItem || urlSearchTerm || "";
+    if (looksLikeUrl(instantSearchTerm)) instantSearchTerm = urlSearchTerm;
+
     const { rows } = await adminPool.query(
       `INSERT INTO community_requests
        (name, whatsapp, reference_url, reference_product_id, desired_item, suggested_group_key, notes, status, created_at, updated_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,'pendente',NOW(),NOW()) RETURNING id,status,created_at`,
       [name, whatsapp, referenceUrl || "", referenceProductId, desiredItem || "", suggestedGroupKey, notes]
     );
-    console.log(`[community] nova solicitação #${rows[0].id}: ${desiredItem || "[somente link]"} -> ${suggestedGroupKey}`);
-    res.status(201).json({ ok: true, request: rows[0] });
-  } catch (error) { console.error("[community] create:", error); res.status(500).json({ error: "Não foi possível registrar sua solicitação." }); }
+    const requestRow = rows[0];
+    console.log(`[community] nova solicitação #${requestRow.id}: ${desiredItem || "[somente link]"} -> ${suggestedGroupKey}`);
+
+    let lookup = null;
+    let instant = { status: "erro_consulta", sent: 0, error: null };
+    try {
+      if (referenceProductId && /^MLB\d+$/i.test(referenceProductId) && !/^MLBU/i.test(referenceProductId)) {
+        lookup = await runManualLookup({ productId: referenceProductId });
+      }
+      if (!lookup?.results?.length && instantSearchTerm) {
+        lookup = await runManualLookup({ term: instantSearchTerm });
+      }
+
+      const delivery = await sendLookupToCustomer({ whatsapp, name, term: instantSearchTerm || desiredItem || "produto solicitado", lookup });
+      instant = { status: delivery.status, sent: delivery.sent, error: null };
+      await adminPool.query(
+        `UPDATE community_requests SET instant_lookup_count=$2, instant_response_status=$3, instant_response_error=NULL, instant_response_at=NOW(), updated_at=NOW() WHERE id=$1`,
+        [requestRow.id, Number(lookup?.results?.length || 0), delivery.status]
+      );
+      console.log(`[community/private] #${requestRow.id}: ${delivery.status} | ${delivery.sent} enviada(s)`);
+    } catch (error) {
+      const message = String(error?.message || error).slice(0, 800);
+      instant = { status: "erro_whatsapp", sent: 0, error: message };
+      await adminPool.query(
+        `UPDATE community_requests SET instant_lookup_count=$2, instant_response_status=$3, instant_response_error=$4, instant_response_at=NOW(), updated_at=NOW() WHERE id=$1`,
+        [requestRow.id, Number(lookup?.results?.length || 0), instant.status, message]
+      ).catch(() => null);
+      console.error(`[community/private] #${requestRow.id}:`, error);
+    }
+
+    res.status(201).json({ ok: true, request: requestRow, instant });
+  } catch (error) {
+    console.error("[community] create:", error);
+    res.status(500).json({ error: "Não foi possível registrar sua solicitação." });
+  }
 });
 
 app.get("/admin", adminAuth, (_req, res) => {
@@ -343,7 +434,7 @@ app.get("/admin", adminAuth, (_req, res) => {
 <section class="card"><h2>Categorias e grupos</h2><div class="form"><input id="catName" placeholder="Nome da nova categoria"><textarea id="catSearch" placeholder="Buscas automáticas (opcional) — uma por linha ou separadas por vírgula"></textarea><select id="catWhatsApp"><option value="">Sem grupo por enquanto</option></select><button id="catAdd">+ CRIAR</button></div><div class="checks"><label><input type="checkbox" id="catPublic" checked> Exibir no formulário público</label><label><input type="checkbox" id="catMirror" checked> Espelhar ofertas no Geral</label></div><div class="hint">Crie o grupo no WhatsApp, depois selecione-o aqui. Em “Buscas automáticas”, você pode cadastrar até 15 termos, um por linha ou separados por vírgula/ponto e vírgula. Cada termo será pesquisado separadamente e os resultados serão reunidos nesta categoria. Sem termos, a categoria ainda pode receber produtos fixados e pedidos aprovados.</div><div id="catMessage" class="msg"></div><div class="tablewrap"><div id="categories" class="empty">Carregando...</div></div></section>
 <section class="card"><h2>Adicionar produto ao monitoramento permanente</h2><div class="form3"><input id="product" placeholder="MLB29089153 ou link completo do Mercado Livre"><select id="group"></select><button id="add">+ ADICIONAR</button></div><div class="hint">O produto continua precisando passar pelos critérios atuais. O grupo Geral não é selecionável: ofertas específicas podem ser espelhadas para ele automaticamente.</div><div id="message" class="msg"></div></section>
 <section class="card"><div class="topline"><h2>Produtos fixados</h2><button class="refresh" id="refresh">Atualizar</button></div><div class="tablewrap"><div id="content" class="empty">Carregando...</div></div></section>
-<section class="card"><div class="topline"><div><h2>Pedidos da Comunidade</h2><div class="hint" style="margin-top:-8px">O usuário pode enviar descrição, link, ou ambos. Ao aprovar, o Auvello faz uma consulta imediata do produto e o termo continua nas buscas automáticas.</div></div><button class="refresh" id="refreshRequests">Atualizar</button></div><div id="requests" class="empty">Carregando...</div></section>
+<section class="card"><div class="topline"><div><h2>Pedidos da Comunidade</h2><div class="hint" style="margin-top:-8px">O cliente recebe uma consulta automática no WhatsApp ao enviar o pedido. A solicitação continua pendente aqui; ao aprovar, o termo entra nas buscas automáticas.</div></div><button class="refresh" id="refreshRequests">Atualizar</button></div><div id="requests" class="empty">Carregando...</div></section>
 </div><div id="lookupBackdrop" class="lookup-backdrop"><div class="lookup-modal"><div class="lookup-head"><h3 id="lookupTitle">Consulta</h3><button id="lookupClose" class="lookup-close">Fechar</button></div><div id="lookupBody" class="lookup-results"></div><div id="lookupDispatch" class="lookup-dispatch" style="display:none"><div><label for="lookupGroup">Enviar ofertas para</label><select id="lookupGroup"></select></div><button id="lookupSend">DISPARAR OFERTAS</button><div id="lookupDispatchStatus" class="lookup-dispatch-status"></div></div></div></div><script>
 const $=id=>document.getElementById(id);const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));const fmtDate=v=>v?new Date(v).toLocaleString('pt-BR'):'—';const money=v=>v==null?'—':Number(v).toLocaleString('pt-BR',{style:'currency',currency:'BRL'});async function api(url,options={}){const r=await fetch(url,{headers:{'Content-Type':'application/json',...(options.headers||{})},...options});const d=await r.json().catch(()=>({}));if(!r.ok){const e=new Error(d.error||'Erro na requisição');e.status=r.status;e.data=d;throw e;}return d;}
 let CURRENT_LOOKUP_RESULTS=[];
@@ -361,7 +452,7 @@ async function deleteCategory(row){if(!confirm('Excluir esta categoria? Se ela j
 async function loadProducts(){try{const d=await api('/api/admin/products');const M=catMap();if(!d.products.length){$('content').innerHTML='<div class="empty">Nenhum produto fixado ainda.</div>';return;}$('content').innerHTML='<table><thead><tr><th>Produto</th><th>Categoria</th><th>Status</th><th>Última publicação</th><th>Publicado em</th><th>Adicionado</th><th>Ações</th></tr></thead><tbody>'+d.products.map(p=>'<tr><td><strong>'+esc(p.product_id)+'</strong></td><td>'+esc(M[p.group_key]||p.group_key)+'</td><td><span class="pill '+(p.active?'':'off')+'">'+(p.active?'ATIVO':'PAUSADO')+'</span></td><td>'+(p.last_price==null?'—':money(p.last_price))+(p.last_discount==null?'':'<br><small>'+Number(p.last_discount).toFixed(1)+'% OFF</small>')+'</td><td>'+fmtDate(p.last_sent_at)+'</td><td>'+fmtDate(p.created_at)+'</td><td class="actions"><button data-lookup="'+esc(p.product_id)+'">Consultar agora</button><button class="secondary" data-toggle="'+esc(p.product_id)+'" data-active="'+(!p.active)+'">'+(p.active?'Pausar':'Ativar')+'</button><button class="danger" data-remove="'+esc(p.product_id)+'">Excluir</button></td></tr>').join('')+'</tbody></table>';$('content').querySelectorAll('[data-lookup]').forEach(b=>b.onclick=async()=>{const original=b.textContent;b.disabled=true;b.textContent='Consultando...';try{const d=await api('/api/admin/products/'+encodeURIComponent(b.dataset.lookup)+'/lookup',{method:'POST',body:'{}'});showLookup('Consulta manual — '+b.dataset.lookup,d.lookup,d.lookup_error);}catch(e){showLookup('Consulta manual — '+b.dataset.lookup,null,e.message);}finally{b.disabled=false;b.textContent=original;}});$('content').querySelectorAll('[data-toggle]').forEach(b=>b.onclick=async()=>{await api('/api/admin/products/'+encodeURIComponent(b.dataset.toggle),{method:'PATCH',body:JSON.stringify({active:b.dataset.active==='true'})});loadProducts();});$('content').querySelectorAll('[data-remove]').forEach(b=>b.onclick=async()=>{if(confirm('Remover produto?')){await api('/api/admin/products/'+encodeURIComponent(b.dataset.remove),{method:'DELETE'});loadProducts();}});}catch(e){$('content').innerHTML='<div class="empty">Erro: '+esc(e.message)+'</div>';}}
 async function addProduct(){const value=$('product').value.trim(),groupKey=$('group').value;if(!value||!groupKey)return;try{await api('/api/admin/products',{method:'POST',body:JSON.stringify({value,groupKey})});$('product').value='';$('message').textContent='Produto adicionado.';loadProducts();}catch(e){$('message').textContent=e.message;}}
 const statusInfo={pendente:'PENDENTE',em_analise:'EM ANÁLISE',aprovado:'APROVADO',rejeitado:'REJEITADO',precisa_contato:'PRECISA CONTATO'};function digits(v){const d=String(v||'').replace(/\D/g,'');return(d.length===10||d.length===11)?'55'+d:d;}
-async function loadRequests(){try{const d=await api('/api/admin/community-requests');const M=catMap();if(!d.requests.length){$('requests').innerHTML='<div class="empty">Nenhuma solicitação.</div>';return;}$('requests').innerHTML=d.requests.map(r=>{const group=r.approved_group_key||r.suggested_group_key;const search=r.approved_search_term||r.desired_item||'';const ref=r.reference_url?'<div class="note"><strong>Link:</strong> <a target="_blank" style="color:#72eda0" href="'+esc(r.reference_url)+'">abrir referência</a></div>':'';const pedido=r.desired_item?'<div class="note"><strong>Pedido:</strong> '+esc(r.desired_item)+'</div>':'<div class="note"><strong>Pedido:</strong> somente link de referência</div>';return '<div class="request" data-request="'+r.id+'"><div class="request-head"><div><h3>#'+r.id+' — '+esc(r.name)+'</h3><div class="meta">'+fmtDate(r.created_at)+' · <a style="color:#72eda0" target="_blank" href="https://wa.me/'+esc(digits(r.whatsapp))+'">'+esc(r.whatsapp)+'</a></div></div><span class="pill">'+esc(statusInfo[r.status]||r.status)+'</span></div>'+pedido+ref+'<div class="note"><strong>Categoria sugerida:</strong> '+esc(M[r.suggested_group_key]||r.suggested_group_key)+'</div>'+(r.notes?'<div class="note"><strong>Observação:</strong> '+esc(r.notes)+'</div>':'')+'<div class="request-grid"><div><label>Termo que o Auvello pesquisará</label><input data-f="search" maxlength="180" value="'+esc(search)+'" placeholder="Digite manualmente se o usuário enviou só o link"></div><div><label>Categoria validada</label><select data-f="group">'+activeOptions(group)+'</select></div></div><div class="community-actions"><button class="secondary" data-status="em_analise">Em análise</button><button data-status="aprovado">Aprovar</button><button class="secondary" data-status="precisa_contato">Precisa contato</button><button class="danger" data-status="rejeitado">Rejeitar</button></div></div>';}).join('');$('requests').querySelectorAll('[data-request]').forEach(card=>card.querySelectorAll('[data-status]').forEach(b=>b.onclick=()=>updateRequest(card,b.dataset.status)));}catch(e){$('requests').innerHTML='<div class="empty">Erro: '+esc(e.message)+'</div>';}}
+async function loadRequests(){try{const d=await api('/api/admin/community-requests');const M=catMap();if(!d.requests.length){$('requests').innerHTML='<div class="empty">Nenhuma solicitação.</div>';return;}$('requests').innerHTML=d.requests.map(r=>{const group=r.approved_group_key||r.suggested_group_key;const search=r.approved_search_term||r.desired_item||'';const ref=r.reference_url?'<div class="note"><strong>Link:</strong> <a target="_blank" style="color:#72eda0" href="'+esc(r.reference_url)+'">abrir referência</a></div>':'';const pedido=r.desired_item?'<div class="note"><strong>Pedido:</strong> '+esc(r.desired_item)+'</div>':'<div class="note"><strong>Pedido:</strong> somente link de referência</div>';const instantLabel=r.instant_response_status==='enviado'?'✅ Resposta automática: '+Number(r.instant_lookup_count||0)+' resultado(s), enviada em '+fmtDate(r.instant_response_at):r.instant_response_status==='sem_resultado'?'🔎 Resposta automática: nenhuma oferta relevante encontrada em '+fmtDate(r.instant_response_at):r.instant_response_status==='sem_link_afiliado'?'⚠️ Resposta automática: resultados encontrados, mas sem link afiliado disponível':r.instant_response_status?'⚠️ Resposta automática falhou'+(r.instant_response_error?' — '+esc(r.instant_response_error):''):'⏳ Resposta automática ainda não registrada';const instantNote='<div class="note"><strong>'+instantLabel+'</strong></div>';return '<div class="request" data-request="'+r.id+'"><div class="request-head"><div><h3>#'+r.id+' — '+esc(r.name)+'</h3><div class="meta">'+fmtDate(r.created_at)+' · <a style="color:#72eda0" target="_blank" href="https://wa.me/'+esc(digits(r.whatsapp))+'">'+esc(r.whatsapp)+'</a></div></div><span class="pill">'+esc(statusInfo[r.status]||r.status)+'</span></div>'+pedido+ref+instantNote+'<div class="note"><strong>Categoria sugerida:</strong> '+esc(M[r.suggested_group_key]||r.suggested_group_key)+'</div>'+(r.notes?'<div class="note"><strong>Observação:</strong> '+esc(r.notes)+'</div>':'')+'<div class="request-grid"><div><label>Termo que o Auvello pesquisará</label><input data-f="search" maxlength="180" value="'+esc(search)+'" placeholder="Digite manualmente se o usuário enviou só o link"></div><div><label>Categoria validada</label><select data-f="group">'+activeOptions(group)+'</select></div></div><div class="community-actions"><button class="secondary" data-status="em_analise">Em análise</button><button data-status="aprovado">Aprovar</button><button class="secondary" data-status="precisa_contato">Precisa contato</button><button class="danger" data-status="rejeitado">Rejeitar</button></div></div>';}).join('');$('requests').querySelectorAll('[data-request]').forEach(card=>card.querySelectorAll('[data-status]').forEach(b=>b.onclick=()=>updateRequest(card,b.dataset.status)));}catch(e){$('requests').innerHTML='<div class="empty">Erro: '+esc(e.message)+'</div>';}}
 async function updateRequest(card,status){const search=card.querySelector('[data-f="search"]').value.trim(),groupKey=card.querySelector('[data-f="group"]').value;const button=card.querySelector('[data-status="'+status+'"]');const original=button?.textContent;if(button&&status==='aprovado'){button.disabled=true;button.textContent='Consultando...';}try{const d=await api('/api/admin/community-requests/'+card.dataset.request,{method:'PATCH',body:JSON.stringify({status,approvedSearchTerm:search,approvedGroupKey:groupKey})});if(status==='aprovado')showLookup('Consulta após aprovação — '+search,d.lookup,d.lookup_error);await loadRequests();}catch(e){alert(e.message);}finally{if(button){button.disabled=false;if(original)button.textContent=original;}}}
 $('catAdd').onclick=createCategory;$('add').onclick=addProduct;$('refresh').onclick=loadProducts;$('refreshRequests').onclick=loadRequests;(async()=>{await loadWhatsAppGroups();await loadCategories();await loadProducts();await loadRequests();})();
 </script></body></html>`);
@@ -464,7 +555,7 @@ app.patch("/api/admin/products/:productId", adminAuth, async (req,res)=>{
 
 app.delete("/api/admin/products/:productId", adminAuth, async (req,res)=>{const productId=extractProductId(req.params.productId);if(!productId)return res.status(400).json({error:"PRODUCT_ID inválido."});try{const result=await adminPool.query("DELETE FROM admin_monitored_products WHERE product_id=$1",[productId]);if(!result.rowCount)return res.status(404).json({error:"Produto não encontrado."});res.json({ok:true});}catch(error){res.status(500).json({error:"Não foi possível remover o produto."});}});
 
-app.get("/api/admin/community-requests", adminAuth, async (_req,res)=>{try{await ensureAdminTable();const {rows}=await adminPool.query(`SELECT id,name,whatsapp,reference_url,reference_product_id,desired_item,suggested_group_key,approved_group_key,approved_search_term,notes,status,created_at,updated_at FROM community_requests WHERE status IN ('pendente','em_analise','precisa_contato') ORDER BY CASE status WHEN 'pendente' THEN 1 WHEN 'em_analise' THEN 2 WHEN 'precisa_contato' THEN 3 ELSE 4 END,created_at DESC LIMIT 150`);res.json({requests:rows});}catch(error){res.status(500).json({error:"Não foi possível listar os pedidos da comunidade."});}});
+app.get("/api/admin/community-requests", adminAuth, async (_req,res)=>{try{await ensureAdminTable();const {rows}=await adminPool.query(`SELECT id,name,whatsapp,reference_url,reference_product_id,desired_item,suggested_group_key,approved_group_key,approved_search_term,notes,status,instant_lookup_count,instant_response_status,instant_response_error,instant_response_at,created_at,updated_at FROM community_requests WHERE status IN ('pendente','em_analise','precisa_contato') ORDER BY CASE status WHEN 'pendente' THEN 1 WHEN 'em_analise' THEN 2 WHEN 'precisa_contato' THEN 3 ELSE 4 END,created_at DESC LIMIT 150`);res.json({requests:rows});}catch(error){res.status(500).json({error:"Não foi possível listar os pedidos da comunidade."});}});
 
 app.patch("/api/admin/community-requests/:id", adminAuth, async (req,res)=>{
   const id=Number(req.params.id);

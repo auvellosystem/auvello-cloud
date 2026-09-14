@@ -86,6 +86,54 @@ def _tokens(value: str) -> set[str]:
     return {w for w in words if len(w) >= 2 and w not in _STOPWORDS}
 
 
+
+
+_GENERIC_SEARCH_WORDS = {
+    "jogo", "kit", "conjunto", "peca", "pecas", "unidade", "unidades",
+    "novo", "nova", "original", "produto", "modelo",
+}
+
+
+def _search_variants(term: str, max_variants: int = 3) -> list[str]:
+    """Gera poucas variações mais tolerantes sem abrir demais a busca.
+
+    Ex.: "Jogo de Tapete Fusca" ->
+         ["Jogo de Tapete Fusca", "tapete fusca"]
+    """
+    raw = " ".join(str(term or "").split()).strip()
+    if not raw:
+        return []
+
+    variants: list[str] = []
+
+    def add(value: str) -> None:
+        value = " ".join(str(value or "").split()).strip()
+        if not value:
+            return
+        key = value.casefold()
+        if key not in {v.casefold() for v in variants}:
+            variants.append(value)
+
+    add(raw)
+
+    normalized = unicodedata.normalize("NFKD", raw)
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch)).lower()
+    ordered_tokens = [
+        w for w in re.findall(r"[a-z0-9]+", normalized)
+        if len(w) >= 2 and w not in _STOPWORDS
+    ]
+    important = [w for w in ordered_tokens if w not in _GENERIC_SEARCH_WORDS]
+    if len(important) >= 2:
+        add(" ".join(important))
+
+    # Mantém as palavras mais específicas no final como último fallback.
+    # Isso ajuda consultas como "jogo tapete automotivo fusca" sem pesquisar
+    # termos isolados genéricos.
+    if len(important) >= 3:
+        add(" ".join(important[-3:]))
+
+    return variants[:max_variants]
+
 def _relevance(query: str, name: str) -> tuple[float, int]:
     query_tokens = _tokens(query)
     name_tokens = _tokens(name)
@@ -96,10 +144,33 @@ def _relevance(query: str, name: str) -> tuple[float, int]:
 
 
 def lookup_term(client: MercadoLivreClient, term: str, limit: int = 3) -> dict:
-    # O Mercado Livre entrega PRODUCTs em ordem de relevância. Além disso,
-    # calculamos aderência textual para impedir que um item barato, porém só
-    # vagamente relacionado (ex.: um livro), passe na frente do produto pedido.
-    products = client.search_products(q=term, limit=8)
+    # /products/search pode ser bem mais rígido que a busca pública do Mercado
+    # Livre. Fazemos poucas tentativas controladas com o mesmo produto descrito
+    # de forma mais enxuta e depois unificamos os PRODUCTs encontrados.
+    variants = _search_variants(term)
+    product_rows: dict[str, tuple[int, dict]] = {}
+    search_attempts: list[dict] = []
+
+    for variant_index, variant in enumerate(variants):
+        try:
+            rows = client.search_products(q=variant, limit=12)
+        except Exception as exc:
+            print(f"[manual-lookup/termo] busca '{variant}': {exc}", file=sys.stderr)
+            search_attempts.append({"query": variant, "count": 0, "error": str(exc)})
+            continue
+
+        search_attempts.append({"query": variant, "count": len(rows)})
+        for rank, result in enumerate(rows):
+            product_id = result.get("id")
+            if not product_id:
+                continue
+            # Prioriza a posição da primeira variação que encontrou o PRODUCT.
+            combined_rank = variant_index * 100 + rank
+            current = product_rows.get(product_id)
+            if current is None or combined_rank < current[0]:
+                product_rows[product_id] = (combined_rank, result)
+
+    products = [pair[1] for pair in sorted(product_rows.values(), key=lambda x: x[0])]
     candidates: list[tuple[float, int, int, Product]] = []
     query_token_count = len(_tokens(term))
 
@@ -107,8 +178,6 @@ def lookup_term(client: MercadoLivreClient, term: str, limit: int = 3) -> dict:
         product_id = result.get("id")
         if not product_id:
             continue
-        # O search já é chamado com status=active, mas validamos novamente para
-        # evitar produto de catálogo inativo em qualquer resposta inconsistente.
         result_status = str(result.get("status") or "active").lower()
         if result_status != "active":
             continue
@@ -116,8 +185,6 @@ def lookup_term(client: MercadoLivreClient, term: str, limit: int = 3) -> dict:
         result_name = result.get("name") or result.get("family_name") or ""
         coverage, matched = _relevance(term, result_name)
 
-        # Busca longa precisa de aderência mais forte. Isso evita resultados que
-        # coincidem apenas com palavras genéricas como "luz" ou "leitura".
         if query_token_count <= 2:
             min_matches, min_coverage = 1, 0.50
         elif query_token_count <= 4:
@@ -129,15 +196,11 @@ def lookup_term(client: MercadoLivreClient, term: str, limit: int = 3) -> dict:
 
         offers = client.product_offers(product_id, discounted_only=False)
         for offer in _top_unique(offers, 2):
-            # Usa o nome efetivo da oferta/produto, quando disponível, para
-            # recalcular a relevância antes do ranking final.
             effective_coverage, effective_matched = _relevance(term, offer.name or result_name)
             if effective_matched < min_matches:
                 continue
             candidates.append((effective_coverage, effective_matched, rank, offer))
 
-    # Relevância vem antes do preço. Entre opções igualmente aderentes ao pedido,
-    # escolhemos a mais barata e usamos a ordem do Mercado Livre como desempate.
     candidates.sort(
         key=lambda pair: (
             -pair[0],
@@ -162,6 +225,8 @@ def lookup_term(client: MercadoLivreClient, term: str, limit: int = 3) -> dict:
     return {
         "mode": "term",
         "query": term,
+        "search_variants": variants,
+        "search_attempts": search_attempts,
         "searched_products": len(products),
         "results": [_result(product, search_rank=rank + 1) for rank, product in chosen],
     }
