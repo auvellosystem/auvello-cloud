@@ -331,6 +331,75 @@ class Database:
             return None
         return float(rows[1]["price"])
 
+    def last_notification(self, product: Product, group_key: str) -> dict[str, Any] | None:
+        """Última publicação confirmada deste PRODUCT_ID neste grupo."""
+        p = self._ph
+        sql = f"""
+            SELECT price, discount_percent, sent_at
+            FROM product_notifications
+            WHERE catalog_product_key = {p}
+              AND group_key = {p}
+            ORDER BY sent_at DESC
+            LIMIT 1
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                sql,
+                (self.notification_key(product), group_key),
+            ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
+    def can_notify_fixed_product(self, product: Product, group_key: str) -> bool:
+        """Regra especial dos produtos fixados no Admin.
+
+        - Primeira publicação: liberada normalmente.
+        - Oferta melhor que a última publicada: libera imediatamente.
+        - Oferta exatamente igual: pode repetir após o cooldown específico dos fixados.
+        - Oferta pior: não repete.
+
+        Uma oferta é considerada melhor quando o preço atual diminuiu OU o
+        percentual de desconto aumentou em relação à última publicação.
+        """
+        last = self.last_notification(product, group_key)
+        if last is None:
+            return True
+
+        current_price = float(product.price or 0.0)
+        current_discount = float(product.discount_percent or 0.0)
+        last_price = float(last.get("price") or 0.0)
+        last_discount = float(last.get("discount_percent") or 0.0)
+
+        price_better = current_price > 0 and last_price > 0 and current_price < (last_price - 0.009)
+        discount_better = current_discount > (last_discount + 0.009)
+
+        # Qualquer melhora relevante libera o produto imediatamente, mesmo dentro das 12h.
+        if price_better or discount_better:
+            return True
+
+        same_price = abs(current_price - last_price) < 0.01
+        same_discount = abs(current_discount - last_discount) < 0.01
+
+        # Oferta pior (ou diferente sem nenhuma melhora) nunca é repetida.
+        if not (same_price and same_discount):
+            return False
+
+        # Oferta exatamente igual só pode repetir depois do intervalo configurado.
+        sent_at = last.get("sent_at")
+        if isinstance(sent_at, str):
+            try:
+                sent_at = datetime.fromisoformat(sent_at.replace("Z", "+00:00"))
+            except ValueError:
+                return False
+        if sent_at is None:
+            return False
+        if sent_at.tzinfo is None:
+            sent_at = sent_at.replace(tzinfo=timezone.utc)
+
+        min_age = timedelta(hours=max(0, settings.fixed_product_cooldown_hours))
+        return datetime.now(timezone.utc) - sent_at >= min_age
+
     def can_notify(self, product: Product, group_key: str) -> bool:
         since = datetime.now(timezone.utc) - timedelta(hours=settings.cooldown_hours)
         if not self.is_postgres:

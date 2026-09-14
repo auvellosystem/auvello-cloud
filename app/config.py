@@ -46,6 +46,9 @@ class Settings:
     big_discount_percent: float = _float("BIG_DISCOUNT_PERCENT", 20)
     min_price_drop_percent: float = _float("MIN_PRICE_DROP_PERCENT", 10)
     cooldown_hours: int = _int("COOLDOWN_HOURS", 24)
+    # Produtos fixados no Admin: oferta melhor libera imediatamente; oferta
+    # igual só pode repetir após este intervalo; oferta pior não repete.
+    fixed_product_cooldown_hours: int = _int("FIXED_PRODUCT_COOLDOWN_HOURS", 12)
     # Scheduler desacoplado: descoberta no Mercado Livre e publicação usam
     # relógios independentes. O grupo Geral reaproveita o cache e não força
     # uma nova busca no Mercado Livre a cada 5 minutos.
