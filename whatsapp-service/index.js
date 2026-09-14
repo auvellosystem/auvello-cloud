@@ -19,14 +19,11 @@ let latestQr = null;
 const communityRate = new Map();
 const execFileAsync = promisify(execFile);
 
-async function runManualLookup({ productId = null, term = null, referenceUrl = null, fallbackTerm = null } = {}) {
+async function runManualLookup({ productId = null, term = null } = {}) {
   const args = ["manual_lookup.py", "--limit", "3"];
-  if (referenceUrl) {
-    args.push("--reference-url", String(referenceUrl));
-    if (fallbackTerm) args.push("--fallback-term", String(fallbackTerm));
-  } else if (productId) args.push("--product-id", String(productId));
+  if (productId) args.push("--product-id", String(productId));
   else if (term) args.push("--term", String(term));
-  else throw new Error("Informe productId, term ou referenceUrl para a consulta manual.");
+  else throw new Error("Informe productId ou term para a consulta manual.");
 
   const { stdout, stderr } = await execFileAsync("python3", args, {
     cwd: process.cwd(),
@@ -204,6 +201,25 @@ function looksLikeUrl(value) {
   return /^https?:\/\//i.test(text);
 }
 
+function searchTermFromReferenceUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  try {
+    const url = new URL(raw);
+    const parts = url.pathname.split("/").filter(Boolean);
+    const stopIndex = parts.findIndex(part => /^(?:up|p)$/i.test(part));
+    const slugParts = stopIndex > 0 ? parts.slice(0, stopIndex) : parts.slice(0, 1);
+    const slug = slugParts.join(" ")
+      .replace(/[-_]+/g, " ")
+      .replace(/\bMLBU?\d+\b/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    return normalizeText(slug, 180);
+  } catch (_error) {
+    return "";
+  }
+}
+
 function normalizeText(value, maxLength = 300) {
   return String(value || "").trim().replace(/\s+/g, " ").slice(0, maxLength);
 }
@@ -330,7 +346,7 @@ app.get("/admin", adminAuth, (_req, res) => {
 <section class="card"><div class="topline"><div><h2>Pedidos da Comunidade</h2><div class="hint" style="margin-top:-8px">O usuário pode enviar descrição, link, ou ambos. Ao aprovar, o Auvello faz uma consulta imediata do produto e o termo continua nas buscas automáticas.</div></div><button class="refresh" id="refreshRequests">Atualizar</button></div><div id="requests" class="empty">Carregando...</div></section>
 </div><div id="lookupBackdrop" class="lookup-backdrop"><div class="lookup-modal"><div class="lookup-head"><h3 id="lookupTitle">Consulta</h3><button id="lookupClose" class="lookup-close">Fechar</button></div><div id="lookupBody" class="lookup-results"></div></div></div><script>
 const $=id=>document.getElementById(id);const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));const fmtDate=v=>v?new Date(v).toLocaleString('pt-BR'):'—';const money=v=>v==null?'—':Number(v).toLocaleString('pt-BR',{style:'currency',currency:'BRL'});async function api(url,options={}){const r=await fetch(url,{headers:{'Content-Type':'application/json',...(options.headers||{})},...options});const d=await r.json().catch(()=>({}));if(!r.ok){const e=new Error(d.error||'Erro na requisição');e.status=r.status;e.data=d;throw e;}return d;}
-function showLookup(title,lookup,errorText=''){const results=lookup?.results||[];$('lookupTitle').textContent=title;let html='';if(errorText)html='<div class="empty">Erro na consulta: '+esc(errorText)+'</div>';else if(!results.length)html='<div class="empty">Nenhuma oferta encontrada nesta consulta.</div>';else html=results.map((r,i)=>'<div class="lookup-item"><strong>'+(i+1)+'. '+esc(r.name||r.product_id)+'</strong><div class="lookup-price">'+money(r.price)+(r.discount_percent>0?' · '+Number(r.discount_percent).toFixed(1)+'% OFF':'')+'</div><div class="lookup-meta">PRODUCT: '+esc(r.product_id)+(r.item_id?' · ITEM: '+esc(r.item_id):'')+(r.search_rank?' · relevância #'+esc(r.search_rank):'')+'</div><a href="'+esc(r.url)+'" target="_blank" rel="noopener">Abrir no Mercado Livre</a></div>').join('');$('lookupBody').innerHTML=html;$('lookupBackdrop').classList.add('open');}
+function showLookup(title,lookup,errorText=''){const results=lookup?.results||[];$('lookupTitle').textContent=title;let html='';if(errorText)html='<div class="empty">Erro na consulta: '+esc(errorText)+'</div>';else if(!results.length)html='<div class="empty">Nenhuma oferta encontrada nesta consulta.</div>';else html=results.map((r,i)=>'<div class="lookup-item"><strong>'+(i+1)+'. '+esc(r.name||r.product_id)+'</strong><div class="lookup-price">'+money(r.price)+(r.discount_percent>0?' · '+Number(r.discount_percent).toFixed(1)+'% OFF':'')+'</div><div class="lookup-meta">PRODUCT: '+esc(r.product_id)+(r.item_id?' · ITEM: '+esc(r.item_id):'')+(r.search_rank?' · relevância #'+esc(r.search_rank):'')+'</div>'+(r.url?'<a href="'+esc(r.url)+'" target="_blank" rel="noopener">Abrir com link Auvello</a>':'<div class="lookup-meta">Link de afiliado indisponível nesta consulta.</div>')+'</div>').join('');$('lookupBody').innerHTML=html;$('lookupBackdrop').classList.add('open');}
 $('lookupClose').onclick=()=>$('lookupBackdrop').classList.remove('open');$('lookupBackdrop').onclick=e=>{if(e.target===$('lookupBackdrop'))$('lookupBackdrop').classList.remove('open');};
 let CATEGORIES=[];let WA_GROUPS=[];const catMap=()=>Object.fromEntries(CATEGORIES.map(c=>[c.group_key,c.name]));function activeOptions(selected=''){return CATEGORIES.filter(c=>c.active).map(c=>'<option value="'+esc(c.group_key)+'" '+(c.group_key===selected?'selected':'')+'>'+esc(c.name)+'</option>').join('');}function waOptions(selected=''){const known=WA_GROUPS.some(g=>g.id===selected);const extra=selected&&!known?'<option value="'+esc(selected)+'" selected>Grupo atual — '+esc(selected)+'</option>':'';return '<option value="">Sem grupo</option>'+extra+WA_GROUPS.map(g=>'<option value="'+esc(g.id)+'" '+(g.id===selected?'selected':'')+'>'+esc(g.subject)+' — '+esc(g.id)+'</option>').join('');}
 async function loadWhatsAppGroups(){try{const d=await api('/api/admin/whatsapp-groups');WA_GROUPS=d.groups||[];}catch(_e){WA_GROUPS=[];}}
@@ -444,7 +460,7 @@ app.patch("/api/admin/products/:productId", adminAuth, async (req,res)=>{
 
 app.delete("/api/admin/products/:productId", adminAuth, async (req,res)=>{const productId=extractProductId(req.params.productId);if(!productId)return res.status(400).json({error:"PRODUCT_ID inválido."});try{const result=await adminPool.query("DELETE FROM admin_monitored_products WHERE product_id=$1",[productId]);if(!result.rowCount)return res.status(404).json({error:"Produto não encontrado."});res.json({ok:true});}catch(error){res.status(500).json({error:"Não foi possível remover o produto."});}});
 
-app.get("/api/admin/community-requests", adminAuth, async (_req,res)=>{try{await ensureAdminTable();const {rows}=await adminPool.query(`SELECT id,name,whatsapp,reference_url,reference_product_id,desired_item,suggested_group_key,approved_group_key,approved_search_term,notes,status,created_at,updated_at FROM community_requests ORDER BY CASE status WHEN 'pendente' THEN 1 WHEN 'em_analise' THEN 2 WHEN 'precisa_contato' THEN 3 WHEN 'aprovado' THEN 4 WHEN 'rejeitado' THEN 5 ELSE 6 END,created_at DESC LIMIT 150`);res.json({requests:rows});}catch(error){res.status(500).json({error:"Não foi possível listar os pedidos da comunidade."});}});
+app.get("/api/admin/community-requests", adminAuth, async (_req,res)=>{try{await ensureAdminTable();const {rows}=await adminPool.query(`SELECT id,name,whatsapp,reference_url,reference_product_id,desired_item,suggested_group_key,approved_group_key,approved_search_term,notes,status,created_at,updated_at FROM community_requests WHERE status IN ('pendente','em_analise','precisa_contato') ORDER BY CASE status WHEN 'pendente' THEN 1 WHEN 'em_analise' THEN 2 WHEN 'precisa_contato' THEN 3 ELSE 4 END,created_at DESC LIMIT 150`);res.json({requests:rows});}catch(error){res.status(500).json({error:"Não foi possível listar os pedidos da comunidade."});}});
 
 app.patch("/api/admin/community-requests/:id", adminAuth, async (req,res)=>{
   const id=Number(req.params.id);
@@ -461,57 +477,49 @@ app.patch("/api/admin/community-requests/:id", adminAuth, async (req,res)=>{
     if(!current.rows[0])return res.status(404).json({error:"Solicitação não encontrada."});
 
     const currentRow=current.rows[0];
+
+    // Estados que não são aprovação não precisam validar termo/categoria.
+    // Isso garante que Rejeitar/Em análise/Precisa contato funcionem mesmo
+    // quando o pedido foi enviado apenas com link.
+    if(status!=="aprovado"){
+      const {rows}=await adminPool.query(`UPDATE community_requests SET status=$2,updated_at=NOW() WHERE id=$1 RETURNING *`,[id,status]);
+      console.log(`[community] #${id} -> ${status}`);
+      return res.json({request:rows[0],lookup:null,lookup_error:null});
+    }
+
     const referenceProductId=extractProductId(currentRow.reference_url)||currentRow.reference_product_id||null;
-    let finalSearch=approvedSearchTerm||currentRow.approved_search_term||currentRow.desired_item||"";
+    const urlSearchTerm=searchTermFromReferenceUrl(currentRow.reference_url);
+    let finalSearch=approvedSearchTerm||currentRow.approved_search_term||currentRow.desired_item||urlSearchTerm||"";
+    if(looksLikeUrl(finalSearch)) finalSearch=urlSearchTerm;
     const finalGroup=approvedGroupKey||currentRow.approved_group_key||currentRow.suggested_group_key;
     const category=await getCategoryByKey(finalGroup,{activeOnly:true});
+
+    if(!finalSearch||!category)return res.status(400).json({error:"Para aprovar, informe um produto/termo válido e uma categoria ativa."});
+
+    const dup=await adminPool.query(`SELECT id FROM community_requests WHERE id<>$1 AND status='aprovado' AND LOWER(TRIM(approved_search_term))=LOWER(TRIM($2)) AND approved_group_key=$3 LIMIT 1`,[id,finalSearch,finalGroup]);
+    if(dup.rows[0])return res.status(409).json({error:`Já existe um pedido aprovado com esse mesmo termo e categoria (#${dup.rows[0].id}).`});
 
     let lookup=null;
     let lookup_error=null;
 
-    // Links /up/MLBU... são User Products, não PRODUCTs de catálogo.
-    // Para pedidos com link, resolvemos o produto pelo próprio link e só depois
-    // fazemos a busca ampla das melhores ofertas daquele produto.
-    if(status==='aprovado'&&currentRow.reference_url){
-      try{
-        lookup=await runManualLookup({
-          referenceUrl: currentRow.reference_url,
-          fallbackTerm: (!looksLikeUrl(finalSearch) ? finalSearch : null)
-        });
-
-        const resolvedName=lookup?.resolved_term||lookup?.results?.[0]?.name;
-        if((!finalSearch||looksLikeUrl(finalSearch))&&resolvedName){
-          finalSearch=normalizeText(resolvedName,180);
-        }
-
-        console.log(`[manual-lookup] aprovação #${id} LINK: ${lookup.results?.length||0} resultados${lookup?.resolved_term?` | ${lookup.resolved_term}`:''}`);
-      }catch(error){
-        lookup_error=String(error?.message||error);
-        console.error(`[manual-lookup] aprovação #${id} LINK:`,error);
+    try{
+      // MLBU é USER_PRODUCT. Para links /up/MLBU..., consultamos pelo nome
+      // extraído da própria URL. PRODUCT_IDs MLB de catálogo ainda podem usar
+      // consulta direta; se ela vier vazia, caímos para a busca por termo.
+      if(referenceProductId && /^MLB\d+$/i.test(referenceProductId) && !/^MLBU/i.test(referenceProductId)){
+        lookup=await runManualLookup({productId:referenceProductId});
       }
-    }
-
-    if(status==='aprovado'&&(!finalSearch||!category))return res.status(400).json({error:"Para aprovar, informe um produto/termo válido e uma categoria ativa."});
-
-    if(status==='aprovado'){
-      const dup=await adminPool.query(`SELECT id FROM community_requests WHERE id<>$1 AND status='aprovado' AND LOWER(TRIM(approved_search_term))=LOWER(TRIM($2)) AND approved_group_key=$3 LIMIT 1`,[id,finalSearch,finalGroup]);
-      if(dup.rows[0])return res.status(409).json({error:`Já existe um pedido aprovado com esse mesmo termo e categoria (#${dup.rows[0].id}).`});
-    }
-
-    const {rows}=await adminPool.query(`UPDATE community_requests SET status=$2,approved_search_term=$3,approved_group_key=$4,reference_product_id=COALESCE($5,reference_product_id),updated_at=NOW() WHERE id=$1 RETURNING *`,[id,status,finalSearch,finalGroup,referenceProductId]);
-    console.log(`[community] #${id} -> ${status}${status==='aprovado'?` | ${finalSearch} -> ${finalGroup}`:''}`);
-
-    // Sem link de referência, mantém o comportamento por termo.
-    if(status==='aprovado'&&!currentRow.reference_url){
-      try{
+      if(!lookup?.results?.length){
         lookup=await runManualLookup({term:finalSearch});
-        console.log(`[manual-lookup] aprovação #${id} ${finalSearch}: ${lookup.results?.length||0} resultados`);
-      }catch(error){
-        lookup_error=String(error?.message||error);
-        console.error(`[manual-lookup] aprovação #${id}:`,error);
       }
+      console.log(`[manual-lookup] aprovação #${id} ${finalSearch}: ${lookup.results?.length||0} resultados`);
+    }catch(error){
+      lookup_error=String(error?.message||error);
+      console.error(`[manual-lookup] aprovação #${id}:`,error);
     }
 
+    const {rows}=await adminPool.query(`UPDATE community_requests SET status='aprovado',approved_search_term=$2,approved_group_key=$3,reference_product_id=COALESCE($4,reference_product_id),updated_at=NOW() WHERE id=$1 RETURNING *`,[id,finalSearch,finalGroup,referenceProductId]);
+    console.log(`[community] #${id} -> aprovado | ${finalSearch} -> ${finalGroup}`);
     res.json({request:rows[0],lookup,lookup_error});
   }catch(error){
     console.error("[admin/community] update:",error);
