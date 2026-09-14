@@ -19,11 +19,14 @@ let latestQr = null;
 const communityRate = new Map();
 const execFileAsync = promisify(execFile);
 
-async function runManualLookup({ productId = null, term = null } = {}) {
+async function runManualLookup({ productId = null, term = null, referenceUrl = null, fallbackTerm = null } = {}) {
   const args = ["manual_lookup.py", "--limit", "3"];
-  if (productId) args.push("--product-id", String(productId));
+  if (referenceUrl) {
+    args.push("--reference-url", String(referenceUrl));
+    if (fallbackTerm) args.push("--fallback-term", String(fallbackTerm));
+  } else if (productId) args.push("--product-id", String(productId));
   else if (term) args.push("--term", String(term));
-  else throw new Error("Informe productId ou term para a consulta manual.");
+  else throw new Error("Informe productId, term ou referenceUrl para a consulta manual.");
 
   const { stdout, stderr } = await execFileAsync("python3", args, {
     cwd: process.cwd(),
@@ -466,22 +469,25 @@ app.patch("/api/admin/community-requests/:id", adminAuth, async (req,res)=>{
     let lookup=null;
     let lookup_error=null;
 
-    // Se o pedido possui link de referência, a consulta imediata é feita pelo
-    // PRODUCT_ID do catálogo (MLBU/MLB), nunca pelo item_id isolado do anúncio.
-    if(status==='aprovado'&&referenceProductId){
+    // Links /up/MLBU... são User Products, não PRODUCTs de catálogo.
+    // Para pedidos com link, resolvemos o produto pelo próprio link e só depois
+    // fazemos a busca ampla das melhores ofertas daquele produto.
+    if(status==='aprovado'&&currentRow.reference_url){
       try{
-        lookup=await runManualLookup({productId:referenceProductId});
+        lookup=await runManualLookup({
+          referenceUrl: currentRow.reference_url,
+          fallbackTerm: (!looksLikeUrl(finalSearch) ? finalSearch : null)
+        });
 
-        // Pedido só com link (ou URL colada como "termo"):
-        // usa o nome do produto encontrado como termo recorrente.
-        if((!finalSearch||looksLikeUrl(finalSearch))&&lookup?.results?.[0]?.name){
-          finalSearch=normalizeText(lookup.results[0].name,180);
+        const resolvedName=lookup?.resolved_term||lookup?.results?.[0]?.name;
+        if((!finalSearch||looksLikeUrl(finalSearch))&&resolvedName){
+          finalSearch=normalizeText(resolvedName,180);
         }
 
-        console.log(`[manual-lookup] aprovação #${id} PRODUCT ${referenceProductId}: ${lookup.results?.length||0} resultados`);
+        console.log(`[manual-lookup] aprovação #${id} LINK: ${lookup.results?.length||0} resultados${lookup?.resolved_term?` | ${lookup.resolved_term}`:''}`);
       }catch(error){
         lookup_error=String(error?.message||error);
-        console.error(`[manual-lookup] aprovação #${id} PRODUCT ${referenceProductId}:`,error);
+        console.error(`[manual-lookup] aprovação #${id} LINK:`,error);
       }
     }
 
@@ -496,7 +502,7 @@ app.patch("/api/admin/community-requests/:id", adminAuth, async (req,res)=>{
     console.log(`[community] #${id} -> ${status}${status==='aprovado'?` | ${finalSearch} -> ${finalGroup}`:''}`);
 
     // Sem link de referência, mantém o comportamento por termo.
-    if(status==='aprovado'&&!referenceProductId){
+    if(status==='aprovado'&&!currentRow.reference_url){
       try{
         lookup=await runManualLookup({term:finalSearch});
         console.log(`[manual-lookup] aprovação #${id} ${finalSearch}: ${lookup.results?.length||0} resultados`);
