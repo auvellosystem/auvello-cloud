@@ -89,6 +89,15 @@ class MercadoLivreClient:
     def get_product_raw(self, product_id: str) -> dict:
         return self._get(f"/products/{product_id}")
 
+    def get_user_product_raw(self, user_product_id: str) -> dict:
+        """Obtém metadados de um User Product (MLBU...) quando a API permitir.
+
+        Esse recurso é diferente de /products/{PRODUCT_ID}. Alguns User Products
+        de terceiros podem não estar disponíveis para o token da aplicação; por
+        isso o chamador deve tratar falhas como fallback, não como erro fatal.
+        """
+        return self._get(f"/user-products/{user_product_id}")
+
     def product_offers(
         self,
         product_id: str,
