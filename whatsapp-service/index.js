@@ -359,7 +359,7 @@ async function sendLookupToCustomer({ whatsapp, name, term, lookup }) {
   const recipientDigits = personalWhatsappDigits(whatsapp);
   console.log(`[community/private] remetente=${formatBrazilMobileFromDigits(AUVELL0_PUBLIC_SENDER_LOCAL)} destinatario=***${recipientDigits.slice(-4)}`);
   const safeName = normalizeText(name, 80) || "cliente";
-  const safeTerm = normalizeText(term, 180) || "produto solicitado";
+  const safeTerm = normalizeText(lookup?.resolved_term || term, 180) || "produto solicitado";
 
   if (!results.length) {
     await sendVerifiedPersonalMessage(jid, { text: `Olá, *${safeName}*! 🔎\n\nA Auvello pesquisou *${safeTerm}*, mas não encontrou uma oferta relevante agora.\n\nSeu pedido foi registrado e ficará pendente para análise.` });
@@ -370,7 +370,7 @@ async function sendLookupToCustomer({ whatsapp, name, term, lookup }) {
     return { sent: 0, status: "sem_link_afiliado", jid };
   }
 
-  await sendVerifiedPersonalMessage(jid, { text: `Olá, *${safeName}*! 🔎\n\nA Auvello encontrou ${sendable.length} oferta(s) para *${safeTerm}*:` });
+  await sendVerifiedPersonalMessage(jid, { text: `Olá, *${safeName}*! 🔎\n\nA Auvello encontrou ${sendable.length} ${sendable.length === 1 ? "oferta" : "ofertas"} para *${safeTerm}*:` });
   let sent = 0;
   for (const result of sendable) {
     const message = lookupDispatchMessage(result);
