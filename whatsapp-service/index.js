@@ -396,19 +396,6 @@ function maskBrazilPhone(value) {
   return `(${digits.slice(0, 2)}) ${digits.slice(2, 7)}-${digits.slice(7, 11)}`;
 }
 
-
-const auvelloPhoneInput =
-  document.getElementById('customerPhone') ||
-  document.getElementById('requestPhone') ||
-  document.getElementById('phone');
-
-if (auvelloPhoneInput) {
-  auvelloPhoneInput.addEventListener('input', (e) => {
-    e.target.value = maskBrazilPhone(e.target.value);
-  });
-}
-
-
 app.get("/pedir-oferta", async (_req, res) => {
   let categories = [];
   try { categories = await listCategories({ activeOnly: true, publicOnly: true }); }
