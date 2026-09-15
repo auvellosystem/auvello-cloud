@@ -1119,24 +1119,73 @@ def lookup_reference(client: MercadoLivreClient, reference_url: str, limit: int 
             direct = None
             resolve_errors.append(f"product_direct:{mlbu}: {exc}")
         if direct and direct.get("results"):
-            enriched_results, catalog_name = _enrich_catalog_results(
+            exact_results, catalog_name = _enrich_catalog_results(
                 client,
                 mlbu,
                 direct.get("results") or [],
             )
-            direct["results"] = enriched_results
-            direct.update({
+
+            similar_results = []
+            if catalog_name:
+                try:
+                    similar_payload = lookup_term(client, catalog_name, max(limit * 3, 6))
+                    similar_results = list(similar_payload.get("results") or [])
+                except Exception as exc:
+                    resolve_errors.append(f"similar_lookup:{catalog_name}: {exc}")
+
+            merged = []
+            seen = set()
+
+            def add_candidate(row):
+                if not isinstance(row, dict):
+                    return
+                key = (
+                    str(row.get("item_id") or "").strip().upper()
+                    or str(row.get("product_id") or "").strip().upper()
+                    or str(row.get("url") or "").strip()
+                    or f"{row.get('name')}:{row.get('price')}"
+                )
+                if not key or key in seen:
+                    return
+                seen.add(key)
+                merged.append(row)
+
+            # Sempre mantém primeiro o produto exato do link compartilhado.
+            for row in exact_results:
+                add_candidate(row)
+
+            # Depois acrescenta alternativas relevantes.
+            for row in similar_results:
+                add_candidate(row)
+
+            # Entre as alternativas já consideradas relevantes, prioriza menor preço.
+            exact_count = len(exact_results)
+            if len(merged) > exact_count:
+                head = merged[:exact_count]
+                tail = merged[exact_count:]
+                tail.sort(
+                    key=lambda r: (
+                        r.get("price") is None,
+                        float(r.get("price") or 10**18),
+                        -float(r.get("discount_percent") or 0),
+                    )
+                )
+                merged = head + tail
+
+            return {
                 "mode": "reference",
-                "source": "product_direct",
+                "source": "product_direct+similar",
                 "reference_url": reference_url,
                 "reference_product_id": mlbu,
                 "reference_item_id": item_id,
                 "resolved_term": catalog_name,
                 "resolve_errors": resolve_errors,
-            })
-            return direct
+                "results": merged[:limit],
+            }
 
     term = _term_from_reference_slug(reference_url)
+    if str(term or "").strip().lower() in {"up", "p", "produto", "product"}:
+        term = ""
 
     if not term:
         term, err = _resolve_reference_via_http(reference_url)
