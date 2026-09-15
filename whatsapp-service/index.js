@@ -269,8 +269,16 @@ async function sendLookupToCustomer({ whatsapp, name, term, lookup }) {
   for (const result of sendable) {
     const message = lookupDispatchMessage(result);
     const picture = String(result?.picture || "").trim();
-    if (picture) await sock.sendMessage(jid, { image: { url: picture }, caption: message });
-    else await sock.sendMessage(jid, { text: message });
+    if (picture) {
+      try {
+        await sock.sendMessage(jid, { image: { url: picture }, caption: message });
+      } catch (imageError) {
+        console.log("[community/private] imagem falhou, enviando texto:", String(imageError?.message || imageError));
+        await sock.sendMessage(jid, { text: message });
+      }
+    } else {
+      await sock.sendMessage(jid, { text: message });
+    }
     sent += 1;
   }
   await sock.sendMessage(jid, { text: "✅ Seu pedido também foi registrado no Auvello e ficará pendente para análise." });
@@ -596,6 +604,7 @@ app.patch("/api/admin/community-requests/:id", adminAuth, async (req,res)=>{
 
     let lookup=null;
     let lookup_error=null;
+    let approvalDelivery=null;
 
     try{
       // MLBU é USER_PRODUCT. Para links /up/MLBU..., consultamos pelo nome
@@ -608,14 +617,30 @@ app.patch("/api/admin/community-requests/:id", adminAuth, async (req,res)=>{
         lookup=await runManualLookup({term:finalSearch});
       }
       console.log(`[manual-lookup] aprovação #${id} ${finalSearch}: ${lookup.results?.length||0} resultados`);
+
+      // Aprovação também é uma consulta instantânea para o cliente. Os melhores
+      // resultados disponíveis são enviados mesmo sem atingir desconto/score da
+      // automação dos grupos.
+      try{
+        approvalDelivery=await sendLookupToCustomer({
+          whatsapp:currentRow.whatsapp,
+          name:currentRow.name,
+          term:finalSearch,
+          lookup,
+        });
+        console.log(`[community/private] aprovação #${id}: ${approvalDelivery.status} | ${approvalDelivery.sent} enviada(s)`);
+      }catch(deliveryError){
+        approvalDelivery={status:"erro_whatsapp",sent:0,error:String(deliveryError?.message||deliveryError)};
+        console.error(`[community/private] aprovação #${id}:`,deliveryError);
+      }
     }catch(error){
       lookup_error=String(error?.message||error);
       console.error(`[manual-lookup] aprovação #${id}:`,error);
     }
 
-    const {rows}=await adminPool.query(`UPDATE community_requests SET status='aprovado',approved_search_term=$2,approved_group_key=$3,reference_product_id=COALESCE($4,reference_product_id),updated_at=NOW() WHERE id=$1 RETURNING *`,[id,finalSearch,finalGroup,referenceProductId]);
+    const {rows}=await adminPool.query(`UPDATE community_requests SET status='aprovado',approved_search_term=$2,approved_group_key=$3,reference_product_id=COALESCE($4,reference_product_id),instant_lookup_count=$5,instant_response_status=COALESCE($6,instant_response_status),instant_response_error=$7,instant_response_at=CASE WHEN $6 IS NOT NULL THEN NOW() ELSE instant_response_at END,updated_at=NOW() WHERE id=$1 RETURNING *`,[id,finalSearch,finalGroup,referenceProductId,Number(lookup?.results?.length||0),approvalDelivery?.status||null,approvalDelivery?.error||null]);
     console.log(`[community] #${id} -> aprovado | ${finalSearch} -> ${finalGroup}`);
-    res.json({request:rows[0],lookup,lookup_error});
+    res.json({request:rows[0],lookup,lookup_error,delivery:approvalDelivery});
   }catch(error){
     console.error("[admin/community] update:",error);
     res.status(500).json({error:"Não foi possível atualizar a solicitação."});

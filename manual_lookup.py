@@ -349,9 +349,9 @@ def lookup_term(client: MercadoLivreClient, term: str, limit: int = 3) -> dict:
         key=lambda pair: (
             -pair[0],
             -pair[1],
+            -pair[3].discount_percent,  # promoção é bônus, nunca requisito
             pair[3].price if pair[3].price is not None else float("inf"),
             pair[2],
-            -pair[3].discount_percent,
         )
     )
 
@@ -379,8 +379,29 @@ def lookup_term(client: MercadoLivreClient, term: str, limit: int = 3) -> dict:
         }
 
     # Nada útil no catálogo: procura também nos anúncios públicos do marketplace.
-    public_rows, public_error = _public_marketplace_search(term, limit=20)
-    public_candidates: list[tuple[float, int, float, int, dict]] = []
+    # IMPORTANTE: consulta instantânea não exige desconto/score mínimo. Esses
+    # critérios servem apenas como bônus de ordenação; nunca bloqueiam a resposta.
+    # Tentamos as mesmas variações da busca de catálogo para ampliar a cobertura
+    # sem abrir a pesquisa para termos genéricos demais.
+    public_rows: list[dict] = []
+    public_seen: set[str] = set()
+    public_errors: list[str] = []
+    for public_variant in variants:
+        rows, err = _public_marketplace_search(public_variant, limit=20)
+        if err:
+            public_errors.append(f"{public_variant}: {err}")
+        for row in rows:
+            key = str(row.get("origin_url") or row.get("name") or "").strip().casefold()
+            if not key or key in public_seen:
+                continue
+            public_seen.add(key)
+            public_rows.append(row)
+            if len(public_rows) >= 40:
+                break
+        if len(public_rows) >= 40:
+            break
+    public_error = " | ".join(public_errors) if public_errors else None
+    public_candidates: list[tuple[float, int, float, float, int, dict]] = []
     query_token_count = len(_tokens(term))
     if query_token_count <= 2:
         public_min_matches, public_min_coverage = 1, 0.50
@@ -395,12 +416,17 @@ def lookup_term(client: MercadoLivreClient, term: str, limit: int = 3) -> dict:
             continue
         price = row.get("price")
         price_sort = float(price) if price is not None else float("inf")
-        public_candidates.append((coverage, matched, price_sort, rank, row))
+        discount = float(row.get("discount_percent") or 0.0)
+        # Relevância manda. Dentro de resultados igualmente relevantes, promoção
+        # ajuda a subir no ranking, mas 0% de desconto continua elegível.
+        public_candidates.append((coverage, matched, discount, price_sort, rank, row))
 
-    public_candidates.sort(key=lambda pair: (-pair[0], -pair[1], pair[2], pair[3]))
+    public_candidates.sort(
+        key=lambda pair: (-pair[0], -pair[1], -pair[2], pair[3], pair[4])
+    )
     public_results = [
         _public_result(row, search_rank=rank + 1)
-        for _coverage, _matched, _price, rank, row in public_candidates[:limit]
+        for _coverage, _matched, _discount, _price, rank, row in public_candidates[:limit]
     ]
 
     return {
