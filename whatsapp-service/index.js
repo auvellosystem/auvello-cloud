@@ -25,6 +25,11 @@ let reconnectTimer = null;
 const communityRate = new Map();
 const execFileAsync = promisify(execFile);
 
+// Número oficial do Auvello usado como REMETENTE das respostas públicas.
+// O número informado pelo cliente no /pedir-oferta é sempre DESTINATÁRIO.
+const AUVELL0_PUBLIC_SENDER_LOCAL = "28999676956";
+const AUVELL0_PUBLIC_SENDER_DIGITS = `55${AUVELL0_PUBLIC_SENDER_LOCAL}`;
+
 async function runManualLookup({ productId = null, term = null, referenceUrl = null } = {}) {
   const args = ["manual_lookup.py", "--limit", "3"];
   if (referenceUrl) args.push("--reference-url", String(referenceUrl));
@@ -235,14 +240,48 @@ function normalizeText(value, maxLength = 300) {
   return String(value || "").trim().replace(/\s+/g, " ").slice(0, maxLength);
 }
 
+function normalizeBrazilMobile(value) {
+  let digits = String(value || "").replace(/\D/g, "");
+  if (digits.startsWith("55") && digits.length === 13) digits = digits.slice(2);
+  if (digits.length !== 11 || digits[2] !== "9") return null;
+  const ddd = digits.slice(0, 2);
+  const first = digits.slice(2, 7);
+  const last = digits.slice(7);
+  return { local: digits, e164: `55${digits}`, formatted: `(${ddd}) ${first}-${last}` };
+}
+
 function personalWhatsappDigits(value) {
+  const br = normalizeBrazilMobile(value);
+  if (br) return br.e164;
   let digits = String(value || "").replace(/\D/g, "");
   if ((digits.length === 10 || digits.length === 11) && !digits.startsWith("55")) digits = `55${digits}`;
   return digits.slice(0, 15);
 }
 
-async function resolvePersonalWhatsappJid(value) {
+function connectedWhatsappDigits() {
+  const raw = String(sock?.user?.id || "").split("@")[0].split(":")[0].replace(/\D/g, "");
+  if (!raw) return "";
+  if (raw.length === 11 && !raw.startsWith("55")) return `55${raw}`;
+  return raw;
+}
+
+function formatBrazilMobileFromDigits(value) {
+  let digits = String(value || "").replace(/\D/g, "");
+  if (digits.startsWith("55") && digits.length >= 13) digits = digits.slice(2);
+  if (digits.length !== 11) return digits || "—";
+  return `(${digits.slice(0,2)}) ${digits.slice(2,7)}-${digits.slice(7)}`;
+}
+
+function assertOfficialPublicSender() {
   if (!ready || !sock) throw new Error("WhatsApp do Auvello ainda não está conectado.");
+  const connected = connectedWhatsappDigits();
+  if (connected !== AUVELL0_PUBLIC_SENDER_DIGITS) {
+    throw new Error(`O WhatsApp conectado não é o remetente oficial do Auvello (${formatBrazilMobileFromDigits(AUVELL0_PUBLIC_SENDER_LOCAL)}). Reconecte o número correto pela Admin.`);
+  }
+}
+
+async function resolvePersonalWhatsappJid(value) {
+  assertOfficialPublicSender();
   const digits = personalWhatsappDigits(value);
   if (digits.length < 12 || digits.length > 15) throw new Error("Número de WhatsApp inválido.");
   try {
@@ -259,6 +298,8 @@ async function sendLookupToCustomer({ whatsapp, name, term, lookup }) {
   const results = Array.isArray(lookup?.results) ? lookup.results.slice(0, 3) : [];
   const sendable = results.filter(result => String(result?.url || "").startsWith("http"));
   const jid = await resolvePersonalWhatsappJid(whatsapp);
+  const recipientDigits = personalWhatsappDigits(whatsapp);
+  console.log(`[community/private] remetente=${formatBrazilMobileFromDigits(AUVELL0_PUBLIC_SENDER_LOCAL)} destinatario=***${recipientDigits.slice(-4)}`);
   const safeName = normalizeText(name, 80) || "cliente";
   const safeTerm = normalizeText(term, 180) || "produto solicitado";
 
@@ -358,7 +399,7 @@ app.get("/pedir-oferta", async (_req, res) => {
 <div class="brand"><div class="logo">A</div><div><h1>Encontre uma oferta com a Auvello</h1><p>Peça um produto e receba os resultados no seu WhatsApp.</p></div></div>
 <div class="card"><div class="grid">
 <div><label for="name">Nome</label><input id="name" maxlength="80" autocomplete="name" placeholder="Seu nome"></div>
-<div><label for="whatsapp">WhatsApp para receber as ofertas</label><input id="whatsapp" maxlength="30" inputmode="tel" autocomplete="tel" placeholder="(27) 99999-9999"><div class="help"><strong>O Auvello pesquisará agora e enviará os resultados desta solicitação para este número. Seu pedido também ficará pendente para análise.</strong></div></div>
+<div><label for="whatsapp">WhatsApp para receber as ofertas</label><input id="whatsapp" maxlength="15" inputmode="numeric" autocomplete="tel" placeholder="(DD) 9XXXX-XXXX"><div class="help"><strong>O Auvello pesquisará agora e enviará os resultados desta solicitação para este número. Seu pedido também ficará pendente para análise.</strong></div></div>
 <div class="full notice"><strong>Cole abaixo o link do produto no Mercado Livre.</strong> A Auvello usará esse produto como referência, pesquisará as melhores opções disponíveis e enviará os resultados para seu WhatsApp.</div>
 <div class="full"><label for="referenceUrl">Link do produto no Mercado Livre</label><input id="referenceUrl" maxlength="2000" inputmode="url" placeholder="https://www.mercadolivre.com.br/..."><div class="help">Abra o produto no Mercado Livre, copie o link e cole aqui.</div></div>
 <div><label for="groupKey">Categoria / grupo sugerido</label><select id="groupKey">${options}</select><div class="help">É apenas uma sugestão e pode ser ajustada na análise.</div></div>
@@ -369,11 +410,14 @@ app.get("/pedir-oferta", async (_req, res) => {
 </div></div></div>
 <script>
 const $=id=>document.getElementById(id);const msg=(t,k='')=>{$('message').textContent=t;$('message').className='msg '+k;};
+function maskBrazilMobile(value){let d=String(value||'').replace(/\D/g,'');if(d.startsWith('55')&&d.length>=13)d=d.slice(2);d=d.slice(0,11);if(d.length<=2)return d?('('+d):'';if(d.length<=7)return '('+d.slice(0,2)+') '+d.slice(2);return '('+d.slice(0,2)+') '+d.slice(2,7)+'-'+d.slice(7);}
+$('whatsapp').addEventListener('input',e=>{e.target.value=maskBrazilMobile(e.target.value);});
+$('whatsapp').addEventListener('blur',e=>{e.target.value=maskBrazilMobile(e.target.value);});
 let publicProgressTimer=null;
 function publicProgressSet(value,text){const v=Math.max(0,Math.min(100,Number(value)||0));$('publicProgress').classList.add('active');$('publicProgressBar').style.width=v+'%';$('publicProgressPct').textContent=Math.round(v)+'%';$('publicProgressText').textContent=text||'Processando...';}
 function publicProgressStart(){if(publicProgressTimer)clearInterval(publicProgressTimer);let value=6;publicProgressSet(value,'Identificando o produto...');publicProgressTimer=setInterval(()=>{value=Math.min(92,value+(value<30?4:value<65?2:value<85?1:.5));let text=value<30?'Identificando o produto...':value<62?'Pesquisando as melhores ofertas...':value<82?'Gerando seus links de afiliado...':'Enviando para o WhatsApp...';publicProgressSet(value,text);},700);}
 function publicProgressFinish(text,ok=true){if(publicProgressTimer){clearInterval(publicProgressTimer);publicProgressTimer=null;}publicProgressSet(100,text||'Concluído.');setTimeout(()=>{$('publicProgress').classList.remove('active');if(!ok){$('publicProgressBar').style.width='0%';$('publicProgressPct').textContent='0%';}},1400);}
-$('send').addEventListener('click',async()=>{const payload={name:$('name').value.trim(),whatsapp:$('whatsapp').value.trim(),referenceUrl:$('referenceUrl').value.trim(),groupKey:$('groupKey').value,notes:$('notes').value.trim(),company:$('company').value};if(!payload.name||!payload.whatsapp)return msg('Preencha nome e WhatsApp.','err');if(!payload.referenceUrl)return msg('Cole o link do produto no Mercado Livre.','err');if(!payload.groupKey)return msg('Selecione uma categoria.','err');$('send').disabled=true;msg('');publicProgressStart();try{const r=await fetch('/api/community/requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||'Não foi possível enviar.');if(d.instant?.status==='enviado'){publicProgressFinish('Ofertas enviadas para seu WhatsApp.');msg('Pronto! '+(d.instant.sent||0)+' oferta(s) enviada(s) para seu WhatsApp. Seu pedido também ficou pendente para análise.','ok');}else if(d.instant?.status==='sem_resultado'){publicProgressFinish('Consulta concluída.');msg('Pedido registrado. Não encontramos ofertas para esse produto agora; ele ficou pendente para análise.','ok');}else if(d.instant?.status==='sem_link_afiliado'){publicProgressFinish('Consulta concluída com pendência.');msg('Pedido registrado. Encontramos resultados, mas os links não puderam ser preparados agora. O pedido ficou pendente para análise.','ok');}else{publicProgressFinish('Pedido registrado.');msg('Pedido registrado para análise. Não foi possível entregar a resposta automática no WhatsApp agora.','ok');}$('referenceUrl').value='';$('notes').value='';}catch(e){publicProgressFinish('Falha no processamento.',false);msg(e.message,'err');}finally{$('send').disabled=false;}});
+$('send').addEventListener('click',async()=>{const payload={name:$('name').value.trim(),whatsapp:$('whatsapp').value.trim(),referenceUrl:$('referenceUrl').value.trim(),groupKey:$('groupKey').value,notes:$('notes').value.trim(),company:$('company').value};if(!payload.name||!payload.whatsapp)return msg('Preencha nome e WhatsApp.','err');if(!/^\(\d{2}\) 9\d{4}-\d{4}$/.test(payload.whatsapp))return msg('Informe o WhatsApp no formato (DD) 9XXXX-XXXX.','err');if(!payload.referenceUrl)return msg('Cole o link do produto no Mercado Livre.','err');if(!payload.groupKey)return msg('Selecione uma categoria.','err');$('send').disabled=true;msg('');publicProgressStart();try{const r=await fetch('/api/community/requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||'Não foi possível enviar.');if(d.instant?.status==='enviado'){publicProgressFinish('Ofertas enviadas para seu WhatsApp.');msg('Pronto! '+(d.instant.sent||0)+' oferta(s) enviada(s) para seu WhatsApp. Seu pedido também ficou pendente para análise.','ok');}else if(d.instant?.status==='sem_resultado'){publicProgressFinish('Consulta concluída.');msg('Pedido registrado. Não encontramos ofertas para esse produto agora; ele ficou pendente para análise.','ok');}else if(d.instant?.status==='sem_link_afiliado'){publicProgressFinish('Consulta concluída com pendência.');msg('Pedido registrado. Encontramos resultados, mas os links não puderam ser preparados agora. O pedido ficou pendente para análise.','ok');}else{publicProgressFinish('Pedido registrado.');msg('Pedido registrado para análise. Não foi possível entregar a resposta automática no WhatsApp agora.','ok');}$('referenceUrl').value='';$('notes').value='';}catch(e){publicProgressFinish('Falha no processamento.',false);msg(e.message,'err');}finally{$('send').disabled=false;}});
 </script></body></html>`);
 });
 
@@ -381,14 +425,15 @@ app.post("/api/community/requests", async (req, res) => {
   if (!communityRateAllowed(req)) return res.status(429).json({ error: "Muitas solicitações em pouco tempo. Tente novamente mais tarde." });
   if (req.body?.company) return res.status(201).json({ ok: true });
   const name = normalizeText(req.body?.name, 80);
-  const whatsapp = normalizeWhatsapp(req.body?.whatsapp);
+  const whatsappInfo = normalizeBrazilMobile(req.body?.whatsapp);
+  const whatsapp = whatsappInfo?.formatted || "";
   const rawReference = String(req.body?.referenceUrl || "").trim();
   const referenceUrl = rawReference ? validateMercadoLivreUrl(rawReference) : null;
   const desiredItem = "";
   const suggestedGroupKey = String(req.body?.groupKey || "").trim();
   const notes = normalizeText(req.body?.notes, 500) || null;
   if (name.length < 2) return res.status(400).json({ error: "Informe seu nome." });
-  if (whatsapp.replace(/\D/g, "").length < 10) return res.status(400).json({ error: "Informe um WhatsApp válido para receber as ofertas." });
+  if (!whatsappInfo) return res.status(400).json({ error: "Informe um celular brasileiro válido no formato (DD) 9XXXX-XXXX." });
   if (!rawReference) return res.status(400).json({ error: "Cole o link do produto no Mercado Livre." });
   if (rawReference && !referenceUrl) return res.status(400).json({ error: "O link informado não é um link válido do Mercado Livre." });
   const category = await getCategoryByKey(suggestedGroupKey, { activeOnly: true }).catch(() => null);
@@ -456,7 +501,7 @@ app.get("/admin", adminAuth, (_req, res) => {
 const $=id=>document.getElementById(id);const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));const fmtDate=v=>v?new Date(v).toLocaleString('pt-BR'):'—';const money=v=>v==null?'—':Number(v).toLocaleString('pt-BR',{style:'currency',currency:'BRL'});async function api(url,options={}){const r=await fetch(url,{headers:{'Content-Type':'application/json',...(options.headers||{})},...options});const d=await r.json().catch(()=>({}));if(!r.ok){const e=new Error(d.error||'Erro na requisição');e.status=r.status;e.data=d;throw e;}return d;}
 let WA_STATUS_TIMER=null;
 const WA_STATE_LABELS={starting:'INICIANDO',connecting:'CONECTANDO',connected:'CONECTADO',qr_ready:'AGUARDANDO QR CODE',reconnecting:'RECONECTANDO',disconnected:'DESCONECTADO',logged_out:'SESSÃO ENCERRADA',resetting:'PREPARANDO NOVO QR'};
-async function loadWhatsappStatus(){try{const d=await api('/api/admin/whatsapp-status');const state=d.state||'disconnected';$('waDot').className='wa-dot '+state;$('waStatusText').textContent=WA_STATE_LABELS[state]||state.toUpperCase();const meta=[];if(d.last_connected_at)meta.push('Última conexão: '+fmtDate(d.last_connected_at));if(d.last_disconnected_at)meta.push('Última desconexão: '+fmtDate(d.last_disconnected_at));if(d.last_disconnect_reason)meta.push('Motivo: '+d.last_disconnect_reason);$('waStatusMeta').innerHTML=meta.map(esc).join('<br>')||'Status atualizado agora.';$('waReconnect').disabled=Boolean(d.ready);if(d.ready){$('waQrArea').innerHTML='<div class="empty">✅ WhatsApp conectado. Nenhum QR necessário.</div>';}else if(d.has_qr){await loadWhatsappQr();}else{$('waQrArea').innerHTML='<div class="empty">'+(state==='reconnecting'||state==='connecting'?'Tentando reconectar...':'Aguardando geração do QR Code...')+'</div>';}return d;}catch(e){$('waStatusText').textContent='ERRO AO CONSULTAR';$('waDot').className='wa-dot disconnected';$('waMessage').className='msg err';$('waMessage').textContent=e.message;return null;}}
+async function loadWhatsappStatus(){try{const d=await api('/api/admin/whatsapp-status');const state=d.state||'disconnected';$('waDot').className='wa-dot '+state;$('waStatusText').textContent=WA_STATE_LABELS[state]||state.toUpperCase();const meta=[];if(d.connected_number)meta.push('Número conectado: '+d.connected_number);meta.push('Remetente público esperado: '+(d.expected_public_sender||'(28) 99967-6956'));if(d.sender_matches===false)meta.push('⚠️ O número conectado NÃO é o remetente configurado para /pedir-oferta.');if(d.last_connected_at)meta.push('Última conexão: '+fmtDate(d.last_connected_at));if(d.last_disconnected_at)meta.push('Última desconexão: '+fmtDate(d.last_disconnected_at));if(d.last_disconnect_reason)meta.push('Motivo: '+d.last_disconnect_reason);$('waStatusMeta').innerHTML=meta.map(esc).join('<br>')||'Status atualizado agora.';$('waReconnect').disabled=Boolean(d.ready);if(d.ready){$('waQrArea').innerHTML='<div class="empty">✅ WhatsApp conectado. Nenhum QR necessário.</div>';}else if(d.has_qr){await loadWhatsappQr();}else{$('waQrArea').innerHTML='<div class="empty">'+(state==='reconnecting'||state==='connecting'?'Tentando reconectar...':'Aguardando geração do QR Code...')+'</div>';}return d;}catch(e){$('waStatusText').textContent='ERRO AO CONSULTAR';$('waDot').className='wa-dot disconnected';$('waMessage').className='msg err';$('waMessage').textContent=e.message;return null;}}
 async function loadWhatsappQr(){try{const d=await api('/api/admin/whatsapp-qr');if(d.ready){$('waQrArea').innerHTML='<div class="empty">✅ WhatsApp conectado. Nenhum QR necessário.</div>';return;}if(d.data_url){$('waQrArea').innerHTML='<div class="hint" style="margin:0 0 10px">No WhatsApp: Aparelhos conectados → Conectar aparelho.</div><img alt="QR Code do WhatsApp" src="'+esc(d.data_url)+'">';}else{$('waQrArea').innerHTML='<div class="empty">QR ainda não disponível. Atualizando automaticamente...</div>';}}catch(e){$('waQrArea').innerHTML='<div class="empty">'+esc(e.message)+'</div>';}}
 async function reconnectWhatsapp(newSession=false){if(newSession&&!confirm('Gerar um novo QR encerra a sessão salva do WhatsApp no Auvello. Continuar?'))return;const button=newSession?$('waNewQr'):$('waReconnect');const original=button.textContent;button.disabled=true;button.textContent=newSession?'PREPARANDO...':'RECONECTANDO...';$('waMessage').className='msg';$('waMessage').textContent='';try{await api('/api/admin/whatsapp-reconnect',{method:'POST',body:JSON.stringify({newSession})});$('waMessage').className='msg ok';$('waMessage').textContent=newSession?'Nova sessão iniciada. Aguarde o QR Code aparecer.':'Tentativa de reconexão iniciada.';setTimeout(loadWhatsappStatus,1000);}catch(e){$('waMessage').className='msg err';$('waMessage').textContent=e.message;}finally{button.disabled=false;button.textContent=original;}}
 $('waRefresh').onclick=loadWhatsappStatus;$('waReconnect').onclick=()=>reconnectWhatsapp(false);$('waNewQr').onclick=()=>reconnectWhatsapp(true);
@@ -551,6 +596,9 @@ app.get("/api/admin/whatsapp-status", adminAuth, (_req,res)=>{
     ready,
     state: whatsappState,
     has_qr: Boolean(latestQr),
+    connected_number: connectedWhatsappDigits() ? formatBrazilMobileFromDigits(connectedWhatsappDigits()) : null,
+    expected_public_sender: formatBrazilMobileFromDigits(AUVELL0_PUBLIC_SENDER_LOCAL),
+    sender_matches: ready ? connectedWhatsappDigits() === AUVELL0_PUBLIC_SENDER_DIGITS : null,
     last_connected_at: lastConnectedAt,
     last_disconnected_at: lastDisconnectedAt,
     last_disconnect_reason: lastDisconnectReason
@@ -754,7 +802,7 @@ async function connectWhatsApp(){
       whatsappState="connected";
       lastConnectedAt=new Date().toISOString();
       lastDisconnectReason=null;
-      console.log("WhatsApp conectado.");
+      console.log(`WhatsApp conectado: ${formatBrazilMobileFromDigits(connectedWhatsappDigits())}.`);
     }
     if(connection==="close"){
       ready=false;
