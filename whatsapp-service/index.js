@@ -879,7 +879,9 @@ app.get("/health",(_req,res)=>res.json({ok:true,whatsappReady:ready}));
 app.get("/qr",async(req,res)=>{const configuredSecret=process.env.QR_SECRET?.trim(),supplied=String(req.query.key||"").trim();if(!configuredSecret||supplied!==configuredSecret)return res.status(401).send("Nao autorizado.");if(ready)return res.status(200).type("html").send("<h2>WhatsApp conectado ✅</h2>");if(!latestQr)return res.status(200).type("html").send('<meta http-equiv="refresh" content="3"><h2>Aguardando QR Code...</h2>');try{const dataUrl=await QRCode.toDataURL(latestQr,{errorCorrectionLevel:"M",margin:2,width:420});return res.status(200).type("html").send(`<h2>Conectar WhatsApp ao Auvello</h2><img src="${dataUrl}" style="max-width:100%">`);}catch(error){return res.status(500).send("Nao foi possivel gerar o QR Code.");}});
 function lookupDispatchMessage(result){
   const brl=value=>Number(value||0).toLocaleString("pt-BR",{style:"currency",currency:"BRL"});
-  const lines=["🔥 *ACHADO AUVELLO*","",`*${String(result.name||result.product_id||"Oferta Auvello").trim()}*`,""];
+  const rawName=String(result?.name||"").trim();
+  const displayName=(rawName&&!/^MLBU?\d+$/i.test(rawName))?rawName:"Oferta Auvello";
+  const lines=["🔥 *ACHADO AUVELLO*","",`*${displayName}*`,""];
   const price=Number(result.price||0),original=Number(result.original_price||0),discount=Number(result.discount_percent||0);
   if(original>price&&price>0)lines.push(`De: ~${brl(original)}~`);
   if(price>0)lines.push(`Por: *${brl(price)}*`);
