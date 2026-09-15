@@ -903,9 +903,35 @@ def lookup_reference(client: MercadoLivreClient, reference_url: str, limit: int 
     if not reference_url:
         return {"mode":"reference","query":"","source":"none","results":[]}
     mlbu, item_id = _extract_reference_ids(reference_url)
-    term = _term_from_reference_slug(reference_url)
     resolve_errors=[]
     exact_row=None
+
+    # Caminho direto: quando a própria URL já revela o PRODUCT_ID (MLBU...),
+    # seja em /up/MLBU..., /p/MLBU..., em ?pdp_filters=item_id:MLB... ou no
+    # fragmento #wid=MLB..., consultamos a API oficial de catálogo direto por
+    # esse ID. Isso cobre TANTO links com slug (.../nome-do-produto/up/MLBU...)
+    # QUANTO links "enxutos" compartilhados pelo app (.../up/MLBU...?pdp_filters=...),
+    # sem depender de raspar HTML (que o Mercado Livre pode bloquear com
+    # verificação de conta) nem de uma chave paga do Serper.
+    if mlbu:
+        try:
+            direct = lookup_product(client, mlbu, limit)
+        except Exception as exc:
+            direct = None
+            resolve_errors.append(f"product_direct:{mlbu}: {exc}")
+        if direct and direct.get("results"):
+            direct.update({
+                "mode": "reference",
+                "source": "product_direct",
+                "reference_url": reference_url,
+                "reference_product_id": mlbu,
+                "reference_item_id": item_id,
+                "resolved_term": None,
+                "resolve_errors": resolve_errors,
+            })
+            return direct
+
+    term = _term_from_reference_slug(reference_url)
 
     if not term:
         term, err = _resolve_reference_via_http(reference_url)
