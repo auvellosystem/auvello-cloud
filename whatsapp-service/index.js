@@ -385,17 +385,6 @@ function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 }
 
-function maskBrazilPhone(value) {
-  const digits = String(value || '').replace(/\D/g, '').slice(0, 11);
-
-  if (!digits) return '';
-  if (digits.length === 1) return `(${digits}`;
-  if (digits.length === 2) return `(${digits})`;
-  if (digits.length <= 7) return `(${digits.slice(0, 2)}) ${digits.slice(2)}`;
-
-  return `(${digits.slice(0, 2)}) ${digits.slice(2, 7)}-${digits.slice(7, 11)}`;
-}
-
 app.get("/pedir-oferta", async (_req, res) => {
   let categories = [];
   try { categories = await listCategories({ activeOnly: true, publicOnly: true }); }
@@ -410,7 +399,7 @@ app.get("/pedir-oferta", async (_req, res) => {
 <div class="brand"><div class="logo">A</div><div><h1>Encontre uma oferta com a Auvello</h1><p>Peça um produto e receba os resultados no seu WhatsApp.</p></div></div>
 <div class="card"><div class="grid">
 <div><label for="name">Nome</label><input id="name" maxlength="80" autocomplete="name" placeholder="Seu nome"></div>
-<div><label for="whatsapp">WhatsApp para receber as ofertas</label><input id="whatsapp" maxlength="15" inputmode="numeric" autocomplete="tel" placeholder="(DD) 9XXXX-XXXX"><div class="help"><strong>O Auvello pesquisará agora e enviará os resultados desta solicitação para este número. Seu pedido também ficará pendente para análise.</strong></div></div>
+<div><label for="whatsapp">WhatsApp para receber as ofertas</label><input id="whatsapp" maxlength="11" inputmode="numeric" autocomplete="tel" placeholder="28999676956"><div class="help"><strong>Digite apenas os 11 números, com DDD. O Auvello pesquisará agora e enviará os resultados desta solicitação para este número. Seu pedido também ficará pendente para análise.</strong></div></div>
 <div class="full notice"><strong>Cole abaixo o link do produto no Mercado Livre.</strong> A Auvello usará esse produto como referência, pesquisará as melhores opções disponíveis e enviará os resultados para seu WhatsApp.</div>
 <div class="full"><label for="referenceUrl">Link do produto no Mercado Livre</label><input id="referenceUrl" maxlength="2000" inputmode="url" placeholder="https://www.mercadolivre.com.br/..."><div class="help">Abra o produto no Mercado Livre, copie o link e cole aqui.</div></div>
 <div><label for="groupKey">Categoria / grupo sugerido</label><select id="groupKey">${options}</select><div class="help">É apenas uma sugestão e pode ser ajustada na análise.</div></div>
@@ -421,9 +410,6 @@ app.get("/pedir-oferta", async (_req, res) => {
 </div></div></div>
 <script>
 const $=id=>document.getElementById(id);const msg=(t,k='')=>{$('message').textContent=t;$('message').className='msg '+k;};
-function maskBrazilMobile(value){let d=String(value||'').replace(/\D/g,'');if(d.startsWith('55')&&d.length>=13)d=d.slice(2);d=d.slice(0,11);if(d.length<=2)return d?('('+d):'';if(d.length<=7)return '('+d.slice(0,2)+') '+d.slice(2);return '('+d.slice(0,2)+') '+d.slice(2,7)+'-'+d.slice(7);}
-$('whatsapp').addEventListener('input',e=>{e.target.value=maskBrazilMobile(e.target.value);});
-$('whatsapp').addEventListener('blur',e=>{e.target.value=maskBrazilMobile(e.target.value);});
 let publicProgressTimer=null;
 function publicProgressSet(value,text){const v=Math.max(0,Math.min(100,Number(value)||0));$('publicProgress').classList.add('active');$('publicProgressBar').style.width=v+'%';$('publicProgressPct').textContent=Math.round(v)+'%';$('publicProgressText').textContent=text||'Processando...';}
 function publicProgressStart(){if(publicProgressTimer)clearInterval(publicProgressTimer);let value=6;publicProgressSet(value,'Identificando o produto...');publicProgressTimer=setInterval(()=>{value=Math.min(92,value+(value<30?4:value<65?2:value<85?1:.5));let text=value<30?'Identificando o produto...':value<62?'Pesquisando as melhores ofertas...':value<82?'Gerando seus links de afiliado...':'Enviando para o WhatsApp...';publicProgressSet(value,text);},700);}
@@ -444,7 +430,7 @@ app.post("/api/community/requests", async (req, res) => {
   const suggestedGroupKey = String(req.body?.groupKey || "").trim();
   const notes = normalizeText(req.body?.notes, 500) || null;
   if (name.length < 2) return res.status(400).json({ error: "Informe seu nome." });
-  if (!whatsappInfo) return res.status(400).json({ error: "Informe um celular brasileiro válido no formato (DD) 9XXXX-XXXX." });
+  if (!whatsappInfo) return res.status(400).json({ error: "Informe um celular brasileiro válido com 11 dígitos, incluindo o DDD." });
   if (!rawReference) return res.status(400).json({ error: "Cole o link do produto no Mercado Livre." });
   if (rawReference && !referenceUrl) return res.status(400).json({ error: "O link informado não é um link válido do Mercado Livre." });
   const category = await getCategoryByKey(suggestedGroupKey, { activeOnly: true }).catch(() => null);
