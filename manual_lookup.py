@@ -7,7 +7,7 @@ import sys
 import re
 import unicodedata
 import html as html_lib
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 import requests
 from dataclasses import asdict
 
@@ -65,6 +65,62 @@ def _top_unique(offers: list[Product], limit: int = 3) -> list[Product]:
     return ranked[:limit]
 
 
+def _product_from_buy_box(result: dict, client: MercadoLivreClient) -> Product | None:
+    """Transforma o buy_box_winner do catálogo em uma oferta utilizável.
+
+    /products/search e /products/{id} podem trazer o ganhador mesmo quando
+    /products/{id}/items responde `No winners found`. Na consulta instantânea
+    não descartamos esse ganhador: ele já é uma publicação comprável.
+    """
+    product_id = str(result.get("id") or "").strip()
+    if not product_id:
+        return None
+
+    raw = result
+    winner = raw.get("buy_box_winner")
+    if not isinstance(winner, dict) or not winner.get("item_id") or winner.get("price") is None:
+        try:
+            raw = client.get_product_raw(product_id)
+        except Exception:
+            raw = result
+        winner = raw.get("buy_box_winner") if isinstance(raw, dict) else None
+
+    if not isinstance(winner, dict):
+        return None
+    item_id = str(winner.get("item_id") or "").strip()
+    try:
+        price = float(winner.get("price"))
+    except Exception:
+        price = None
+    if not item_id or price is None or price <= 0:
+        return None
+
+    original_price = winner.get("original_price")
+    try:
+        original_price = float(original_price) if original_price is not None else None
+    except Exception:
+        original_price = None
+
+    name = (raw.get("name") or raw.get("family_name") or result.get("name") or result.get("family_name") or product_id)
+    pictures = raw.get("pictures") or result.get("pictures") or []
+    picture = None
+    if pictures and isinstance(pictures[0], dict):
+        picture = pictures[0].get("url") or pictures[0].get("secure_url")
+
+    return Product(
+        product_id=product_id,
+        item_id=item_id,
+        name=str(name),
+        category_id=winner.get("category_id"),
+        domain_id=raw.get("domain_id") or result.get("domain_id"),
+        price=price,
+        original_price=original_price,
+        currency_id=winner.get("currency_id") or "BRL",
+        permalink=f"https://www.mercadolivre.com.br/p/{product_id}?wid={item_id}",
+        picture=picture,
+    )
+
+
 
 
 def _walk_json(value):
@@ -77,118 +133,170 @@ def _walk_json(value):
             yield from _walk_json(child)
 
 
-def _public_marketplace_search(term: str, limit: int = 12) -> tuple[list[dict], str | None]:
-    """Fallback para termos que não existem no catálogo de PRODUCTs.
+def _public_marketplace_search(term: str, limit: int = 20) -> tuple[list[dict], str | None]:
+    """Busca anúncios públicos do marketplace sem exigir promoção.
 
-    A busca pública do Mercado Livre contém também anúncios tradicionais que não
-    aparecem em /products/search. Extraímos somente dados visíveis na página
-    pública e depois aplicamos o mesmo filtro de relevância do Auvello.
+    Tenta dois formatos públicos do Mercado Livre e entende tanto JSON-LD quanto
+    os cards atuais (`poly-component__title`) e o layout legado (`ui-search`).
+    O fallback é exclusivo da consulta instantânea; a automação dos grupos não
+    depende dele.
     """
-    slug = "-".join(re.findall(r"[a-z0-9]+", unicodedata.normalize("NFKD", term)
-                               .encode("ascii", "ignore").decode("ascii").lower()))
+    normalized = unicodedata.normalize("NFKD", term).encode("ascii", "ignore").decode("ascii")
+    slug = "-".join(re.findall(r"[a-z0-9]+", normalized.lower()))
     if not slug:
         return [], "termo vazio após normalização"
 
-    url = f"https://lista.mercadolivre.com.br/{quote(slug, safe='-')}"
+    urls = [
+        f"https://www.mercadolivre.com.br/jm/search?as_word={quote(term)}",
+        f"https://lista.mercadolivre.com.br/{quote(slug, safe='-')}",
+    ]
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
         ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.7",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     }
-    try:
-        response = requests.get(url, headers=headers, timeout=settings.request_timeout)
-        response.raise_for_status()
-    except Exception as exc:
-        return [], f"busca pública: {exc}"
 
-    text = response.text
     rows: list[dict] = []
     seen_urls: set[str] = set()
+    errors: list[str] = []
 
-    # 1) JSON-LD quando disponível. É o caminho mais estável e evita depender
-    #    de classes CSS do front do Mercado Livre.
-    scripts = re.findall(
-        r'<script[^>]+type=["\\\']application/ld\\+json["\\\'][^>]*>(.*?)</script>',
-        text,
-        flags=re.I | re.S,
-    )
-    for raw in scripts:
+    def add_row(*, title, product_url, price=None, original_price=None, discount=0.0, currency="BRL", picture=None):
+        title = html_lib.unescape(re.sub(r"<[^>]+>", " ", str(title or "")))
+        title = re.sub(r"\s+", " ", title).strip()
+        product_url = html_lib.unescape(str(product_url or "")).replace("&amp;", "&").strip()
+        if product_url.startswith("//"):
+            product_url = "https:" + product_url
+        if not title or not product_url or product_url in seen_urls:
+            return
+        if "mercadolivre.com.br" not in product_url:
+            return
+        seen_urls.add(product_url)
+        rows.append({
+            "name": title,
+            "price": price,
+            "original_price": original_price,
+            "discount_percent": float(discount or 0.0),
+            "currency_id": currency or "BRL",
+            "origin_url": product_url,
+            "picture": picture,
+        })
+
+    for url in urls:
         try:
-            data = json.loads(html_lib.unescape(raw).strip())
-        except Exception:
-            continue
-        for obj in _walk_json(data):
-            typ = obj.get("@type")
-            if isinstance(typ, list):
-                is_product = "Product" in typ
-            else:
-                is_product = typ == "Product"
-            if not is_product:
+            response = requests.get(url, headers=headers, timeout=settings.request_timeout, allow_redirects=True)
+            if response.status_code >= 400:
+                errors.append(f"{response.status_code} em {url}")
                 continue
-            title = str(obj.get("name") or "").strip()
-            product_url = str(obj.get("url") or "").strip()
-            image = obj.get("image")
-            if isinstance(image, list):
-                image = image[0] if image else None
-            offers = obj.get("offers") or {}
-            if isinstance(offers, list):
-                offers = offers[0] if offers else {}
-            price = None
-            if isinstance(offers, dict):
+            text = response.text
+            low = text.lower()
+            if "account-verification" in str(response.url).lower() or "account-verification" in low[:5000]:
+                errors.append(f"verificação de conta em {url}")
+                continue
+        except Exception as exc:
+            errors.append(f"{url}: {exc}")
+            continue
+
+        # 1) JSON-LD: quando a página expõe Product/Offer, é a fonte mais limpa.
+        scripts = re.findall(
+            r'<script[^>]+type=["\\\']application/ld\+json["\\\'][^>]*>(.*?)</script>',
+            text,
+            flags=re.I | re.S,
+        )
+        for raw in scripts:
+            try:
+                data = json.loads(html_lib.unescape(raw).strip())
+            except Exception:
+                continue
+            for obj in _walk_json(data):
+                typ = obj.get("@type")
+                is_product = "Product" in typ if isinstance(typ, list) else typ == "Product"
+                if not is_product:
+                    continue
+                offers = obj.get("offers") or {}
+                if isinstance(offers, list):
+                    offers = offers[0] if offers else {}
                 try:
-                    price = float(offers.get("price")) if offers.get("price") is not None else None
+                    price = float(offers.get("price")) if isinstance(offers, dict) and offers.get("price") is not None else None
                 except Exception:
                     price = None
-            if not title or not product_url or product_url in seen_urls:
+                image = obj.get("image")
+                if isinstance(image, list):
+                    image = image[0] if image else None
+                add_row(
+                    title=obj.get("name"),
+                    product_url=obj.get("url"),
+                    price=price,
+                    currency=(offers.get("priceCurrency") if isinstance(offers, dict) else None) or "BRL",
+                    picture=image if isinstance(image, str) else None,
+                )
+                if len(rows) >= limit:
+                    return rows[:limit], None
+
+        # 2) Cards atuais/legados. Usamos a posição do link no HTML para buscar
+        # preço e desconto no mesmo bloco, sem depender de uma classe única.
+        anchor_pattern = re.compile(
+            r'<a[^>]+(?:class=["\\\'][^"\\\']*(?:poly-component__title|ui-search-link|shops__item-link)[^"\\\']*["\\\'][^>]*)?href=["\\\'](https?://[^"\\\']+mercadolivre\.com\.br/[^"\\\']+)["\\\'][^>]*>(.*?)</a>',
+            re.I | re.S,
+        )
+        for match in anchor_pattern.finditer(text):
+            product_url, title_html = match.group(1), match.group(2)
+            title = re.sub(r"<[^>]+>", " ", title_html)
+            if not title.strip():
                 continue
-            seen_urls.add(product_url)
-            rows.append({
-                "name": title,
-                "price": price,
-                "original_price": None,
-                "discount_percent": 0.0,
-                "currency_id": (offers.get("priceCurrency") if isinstance(offers, dict) else None) or "BRL",
-                "origin_url": product_url,
-                "picture": image if isinstance(image, str) else None,
-            })
+            # Evita links institucionais; anúncios/PDP têm item/catalog id ou slug longo.
+            decoded = unquote(html_lib.unescape(product_url))
+            if not (re.search(r"/p/MLB\d+", decoded, re.I) or re.search(r"/MLB-?\d+", decoded, re.I) or "/up/MLBU" in decoded.upper()):
+                continue
+            block = text[match.start(): min(len(text), match.start() + 5000)]
+            fractions = re.findall(r'andes-money-amount__fraction[^>]*>\s*([0-9][0-9\.]*)\s*<', block, re.I)
+            cents = re.search(r'andes-money-amount__cents[^>]*>\s*([0-9]{1,2})\s*<', block, re.I)
+            def amount(raw):
+                if not raw:
+                    return None
+                try:
+                    base = float(raw.replace(".", ""))
+                    return base + (float(cents.group(1)) / 100 if cents else 0)
+                except Exception:
+                    return None
+            price = amount(fractions[0]) if fractions else None
+            original_price = amount(fractions[1]) if len(fractions) > 1 else None
+            disc_match = re.search(r'([0-9]{1,2})\s*%\s*OFF', block, re.I)
+            discount = float(disc_match.group(1)) if disc_match else 0.0
+            image_match = re.search(r'<img[^>]+(?:data-src|src)=["\\\']([^"\\\']+)["\\\']', block, re.I)
+            add_row(
+                title=title,
+                product_url=product_url,
+                price=price,
+                original_price=original_price,
+                discount=discount,
+                picture=html_lib.unescape(image_match.group(1)) if image_match else None,
+            )
             if len(rows) >= limit:
-                break
-        if len(rows) >= limit:
+                return rows[:limit], None
+
+        # 3) JSON embutido do frontend: captura pares permalink/title comuns.
+        # É propositalmente conservador para não inventar resultados.
+        json_pairs = re.finditer(
+            r'"(?:permalink|url)"\s*:\s*"(https:[^"\\]+mercadolivre\.com\.br[^"\\]+)".{0,1200}?"(?:title|name)"\s*:\s*"([^"\\]{4,220})"',
+            text,
+            re.I | re.S,
+        )
+        for m in json_pairs:
+            product_url = bytes(m.group(1), "utf-8").decode("unicode_escape")
+            title = bytes(m.group(2), "utf-8").decode("unicode_escape")
+            add_row(title=title, product_url=product_url)
+            if len(rows) >= limit:
+                return rows[:limit], None
+
+        if rows:
             break
 
-    # 2) Fallback leve para páginas sem JSON-LD de Product. Captura links de
-    #    anúncios e deriva o título do slug. Preço pode ficar ausente; nesses
-    #    casos o resultado ainda pode ser exibido e o link afiliado continua válido.
-    if not rows:
-        hrefs = re.findall(r'href=["\\\'](https://[^"\\\']+mercadolivre\\.com\\.br/[^"\\\']+)["\\\']', text, flags=re.I)
-        for product_url in hrefs:
-            product_url = html_lib.unescape(product_url)
-            if product_url in seen_urls:
-                continue
-            if not (re.search(r'/p/MLB\\d+', product_url, re.I) or re.search(r'/MLB-?\\d+', product_url, re.I) or '/up/MLBU' in product_url.upper()):
-                continue
-            path = product_url.split('?', 1)[0].rstrip('/').split('/')[-1]
-            path = re.sub(r'^(MLB-?\\d+-)', '', path, flags=re.I)
-            path = re.sub(r'(_JM|MLBU\\d+)$', '', path, flags=re.I)
-            title = re.sub(r'[-_]+', ' ', path).strip().title()
-            if not title:
-                continue
-            seen_urls.add(product_url)
-            rows.append({
-                "name": title,
-                "price": None,
-                "original_price": None,
-                "discount_percent": 0.0,
-                "currency_id": "BRL",
-                "origin_url": product_url,
-                "picture": None,
-            })
-            if len(rows) >= limit:
-                break
-
-    return rows, None
+    return rows[:limit], " | ".join(errors) if errors else None
 
 
 def _public_result(row: dict, *, search_rank: int | None = None) -> dict:
@@ -339,6 +447,11 @@ def lookup_term(client: MercadoLivreClient, term: str, limit: int = 3) -> dict:
             continue
 
         offers = client.product_offers(product_id, discounted_only=False)
+        if not offers:
+            winner_offer = _product_from_buy_box(result, client)
+            if winner_offer is not None:
+                offers = [winner_offer]
+
         for offer in _top_unique(offers, 2):
             effective_coverage, effective_matched = _relevance(term, offer.name or result_name)
             if effective_matched < min_matches:
@@ -428,6 +541,13 @@ def lookup_term(client: MercadoLivreClient, term: str, limit: int = 3) -> dict:
         _public_result(row, search_rank=rank + 1)
         for _coverage, _matched, _discount, _price, rank, row in public_candidates[:limit]
     ]
+
+    if not public_results:
+        print(
+            f"[manual-lookup/termo] '{term}': catálogo={len(products)} PRODUCTs sem oferta utilizável; "
+            f"marketplace={len(public_rows)} candidato(s); erro={public_error or '-'}",
+            file=sys.stderr,
+        )
 
     return {
         "mode": "term",
