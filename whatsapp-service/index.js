@@ -280,18 +280,76 @@ function assertOfficialPublicSender() {
   }
 }
 
+function personalWhatsappCandidates(value) {
+  const primary = personalWhatsappDigits(value);
+  const candidates = [];
+  if (primary) candidates.push(primary);
+
+  // Alguns números brasileiros antigos podem estar registrados no WhatsApp
+  // no formato legado sem o 9 após o DDD. Nunca escolhemos isso "no chute":
+  // a variante só será usada se o próprio onWhatsApp() confirmar que existe.
+  if (
+    primary.startsWith("55") &&
+    primary.length === 13 &&
+    primary[4] === "9"
+  ) {
+    const legacy = `${primary.slice(0, 4)}${primary.slice(5)}`;
+    if (!candidates.includes(legacy)) candidates.push(legacy);
+  }
+
+  return candidates;
+}
+
 async function resolvePersonalWhatsappJid(value) {
   assertOfficialPublicSender();
-  const digits = personalWhatsappDigits(value);
-  if (digits.length < 12 || digits.length > 15) throw new Error("Número de WhatsApp inválido.");
-  try {
-    const checks = await sock.onWhatsApp(digits);
-    const found = Array.isArray(checks) ? checks.find(item => item?.exists && item?.jid) : null;
-    if (found?.jid) return found.jid;
-  } catch (error) {
-    console.log("[community/private] onWhatsApp:", String(error?.message || error));
+
+  const candidates = personalWhatsappCandidates(value);
+  if (!candidates.length) throw new Error("Número de WhatsApp inválido.");
+
+  const errors = [];
+  for (const candidate of candidates) {
+    try {
+      const checks = await sock.onWhatsApp(candidate);
+      const found = Array.isArray(checks)
+        ? checks.find(item => item?.exists && item?.jid)
+        : null;
+
+      if (found?.jid) {
+        console.log(
+          `[community/private] destinatario confirmado pelo WhatsApp: ***${candidate.slice(-4)} -> ${found.jid}`
+        );
+        return found.jid;
+      }
+
+      console.log(
+        `[community/private] destinatario não confirmado: ***${candidate.slice(-4)}`
+      );
+    } catch (error) {
+      const message = String(error?.message || error);
+      errors.push(message);
+      console.log(
+        `[community/private] onWhatsApp ***${candidate.slice(-4)}: ${message}`
+      );
+    }
   }
-  return `${digits}@s.whatsapp.net`;
+
+  // Não enviar para um JID montado manualmente. Isso evitava erro aparente,
+  // mas podia criar mensagem "Aguardando mensagem" sem entrega ao destinatário.
+  throw new Error(
+    `O WhatsApp não confirmou o destinatário informado. Verifique o número e tente novamente.${
+      errors.length ? ` (${errors[0]})` : ""
+    }`
+  );
+}
+
+async function sendVerifiedPersonalMessage(jid, content) {
+  const sent = await sock.sendMessage(jid, content);
+  const messageId = sent?.key?.id || "sem-id";
+  const remoteJid = sent?.key?.remoteJid || jid;
+  console.log(
+    `[community/private] mensagem aceita pelo WhatsApp: id=${messageId} jid=${remoteJid}`
+  );
+  return sent;
 }
 
 async function sendLookupToCustomer({ whatsapp, name, term, lookup }) {
@@ -304,32 +362,32 @@ async function sendLookupToCustomer({ whatsapp, name, term, lookup }) {
   const safeTerm = normalizeText(term, 180) || "produto solicitado";
 
   if (!results.length) {
-    await sock.sendMessage(jid, { text: `Olá, *${safeName}*! 🔎\n\nA Auvello pesquisou *${safeTerm}*, mas não encontrou uma oferta relevante agora.\n\nSeu pedido foi registrado e ficará pendente para análise.` });
+    await sendVerifiedPersonalMessage(jid, { text: `Olá, *${safeName}*! 🔎\n\nA Auvello pesquisou *${safeTerm}*, mas não encontrou uma oferta relevante agora.\n\nSeu pedido foi registrado e ficará pendente para análise.` });
     return { sent: 0, status: "sem_resultado", jid };
   }
   if (!sendable.length) {
-    await sock.sendMessage(jid, { text: `Olá, *${safeName}*! 🔎\n\nA Auvello encontrou resultados para *${safeTerm}*, mas não conseguiu gerar links de afiliado seguros neste momento.\n\nSeu pedido foi registrado e ficará pendente para análise.` });
+    await sendVerifiedPersonalMessage(jid, { text: `Olá, *${safeName}*! 🔎\n\nA Auvello encontrou resultados para *${safeTerm}*, mas não conseguiu gerar links de afiliado seguros neste momento.\n\nSeu pedido foi registrado e ficará pendente para análise.` });
     return { sent: 0, status: "sem_link_afiliado", jid };
   }
 
-  await sock.sendMessage(jid, { text: `Olá, *${safeName}*! 🔎\n\nA Auvello encontrou ${sendable.length} oferta(s) para *${safeTerm}*:` });
+  await sendVerifiedPersonalMessage(jid, { text: `Olá, *${safeName}*! 🔎\n\nA Auvello encontrou ${sendable.length} oferta(s) para *${safeTerm}*:` });
   let sent = 0;
   for (const result of sendable) {
     const message = lookupDispatchMessage(result);
     const picture = String(result?.picture || "").trim();
     if (picture) {
       try {
-        await sock.sendMessage(jid, { image: { url: picture }, caption: message });
+        await sendVerifiedPersonalMessage(jid, { image: { url: picture }, caption: message });
       } catch (imageError) {
         console.log("[community/private] imagem falhou, enviando texto:", String(imageError?.message || imageError));
-        await sock.sendMessage(jid, { text: message });
+        await sendVerifiedPersonalMessage(jid, { text: message });
       }
     } else {
-      await sock.sendMessage(jid, { text: message });
+      await sendVerifiedPersonalMessage(jid, { text: message });
     }
     sent += 1;
   }
-  await sock.sendMessage(jid, { text: "✅ Seu pedido também foi registrado no Auvello e ficará pendente para análise." });
+  await sendVerifiedPersonalMessage(jid, { text: "✅ Seu pedido também foi registrado no Auvello e ficará pendente para análise." });
   return { sent, status: "enviado", jid };
 }
 
