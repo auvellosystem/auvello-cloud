@@ -542,7 +542,11 @@ def _serper_marketplace_search(term: str, limit: int = 20) -> tuple[list[dict], 
                         "discount_percent": 0.0,
                         "currency_id": "BRL",
                         "origin_url": link,
-                        "picture": None,
+                        "picture": (
+                            entry.get("imageUrl")
+                            or entry.get("image")
+                            or entry.get("thumbnail")
+                        ),
                         "external_position": entry.get("position"),
                     })
                     if len(rows) >= limit:
@@ -1013,10 +1017,84 @@ def _resolve_reference_via_serper(reference_url: str, mlbu: str | None, item_id:
                     # Para a busca pelo URL completo, o título ainda pode ser válido.
                     if q != reference_url:
                         continue
-                return title, {"origin_url": link, "name": title}, None
+                return title, {
+                    "origin_url": link,
+                    "name": title,
+                    "picture": (
+                        entry.get("imageUrl")
+                        or entry.get("image")
+                        or entry.get("thumbnail")
+                    ),
+                }, None
         except Exception as exc:
             errors.append(str(exc))
     return "", None, " | ".join(errors) if errors else "referência não localizada"
+
+
+
+def _catalog_display_metadata(client: MercadoLivreClient, product_id: str) -> tuple[str | None, str | None]:
+    """Obtém nome e primeira imagem do catálogo oficial para exibição no WhatsApp."""
+    try:
+        raw = client.get_product_raw(product_id)
+    except Exception as exc:
+        print(f"[manual-lookup/catalog-meta] {product_id}: {exc}", file=sys.stderr)
+        return None, None
+
+    if not isinstance(raw, dict):
+        return None, None
+
+    name = (
+        raw.get("name")
+        or raw.get("family_name")
+        or raw.get("title")
+        or None
+    )
+    name = str(name).strip() if name else None
+    if name and re.fullmatch(r"MLBU?\d+", name, re.I):
+        name = None
+
+    picture = None
+    pictures = raw.get("pictures") or []
+    if isinstance(pictures, list):
+        for row in pictures:
+            if not isinstance(row, dict):
+                continue
+            candidate = (
+                row.get("secure_url")
+                or row.get("url")
+                or row.get("src")
+            )
+            if candidate:
+                picture = str(candidate).strip()
+                break
+
+    if not picture:
+        candidate = raw.get("thumbnail") or raw.get("secure_thumbnail")
+        if candidate:
+            picture = str(candidate).strip()
+
+    return name, picture
+
+
+def _enrich_catalog_results(
+    client: MercadoLivreClient,
+    product_id: str,
+    results: list[dict],
+) -> tuple[list[dict], str | None]:
+    name, picture = _catalog_display_metadata(client, product_id)
+    enriched: list[dict] = []
+
+    for source in results:
+        row = dict(source or {})
+        current_name = str(row.get("name") or "").strip()
+        if not current_name or re.fullmatch(r"MLBU?\d+", current_name, re.I):
+            if name:
+                row["name"] = name
+        if not str(row.get("picture") or "").strip() and picture:
+            row["picture"] = picture
+        enriched.append(row)
+
+    return enriched, name
 
 
 def lookup_reference(client: MercadoLivreClient, reference_url: str, limit: int = 3) -> dict:
@@ -1041,13 +1119,19 @@ def lookup_reference(client: MercadoLivreClient, reference_url: str, limit: int 
             direct = None
             resolve_errors.append(f"product_direct:{mlbu}: {exc}")
         if direct and direct.get("results"):
+            enriched_results, catalog_name = _enrich_catalog_results(
+                client,
+                mlbu,
+                direct.get("results") or [],
+            )
+            direct["results"] = enriched_results
             direct.update({
                 "mode": "reference",
                 "source": "product_direct",
                 "reference_url": reference_url,
                 "reference_product_id": mlbu,
                 "reference_item_id": item_id,
-                "resolved_term": None,
+                "resolved_term": catalog_name,
                 "resolve_errors": resolve_errors,
             })
             return direct
