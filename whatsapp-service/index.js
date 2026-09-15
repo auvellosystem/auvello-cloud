@@ -385,6 +385,30 @@ function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 }
 
+function maskBrazilPhone(value) {
+  const digits = String(value || '').replace(/\D/g, '').slice(0, 11);
+
+  if (!digits) return '';
+  if (digits.length === 1) return `(${digits}`;
+  if (digits.length === 2) return `(${digits})`;
+  if (digits.length <= 7) return `(${digits.slice(0, 2)}) ${digits.slice(2)}`;
+
+  return `(${digits.slice(0, 2)}) ${digits.slice(2, 7)}-${digits.slice(7, 11)}`;
+}
+
+
+const auvelloPhoneInput =
+  document.getElementById('customerPhone') ||
+  document.getElementById('requestPhone') ||
+  document.getElementById('phone');
+
+if (auvelloPhoneInput) {
+  auvelloPhoneInput.addEventListener('input', (e) => {
+    e.target.value = maskBrazilPhone(e.target.value);
+  });
+}
+
+
 app.get("/pedir-oferta", async (_req, res) => {
   let categories = [];
   try { categories = await listCategories({ activeOnly: true, publicOnly: true }); }
