@@ -32,9 +32,9 @@ def _affiliate_url(origin_url: str) -> str | None:
 
 
 def _result(product: Product, *, search_rank: int | None = None) -> dict:
+    # O portal de afiliados é mais estável com a URL canônica do PRODUCT_ID.
+    # Mantemos item_id apenas como metadado da oferta; não anexamos ?wid= ao link.
     origin_url = f"https://www.mercadolivre.com.br/p/{product.product_id}"
-    if product.item_id:
-        origin_url += f"?wid={product.item_id}"
     return {
         "product_id": product.product_id,
         "item_id": product.item_id,
@@ -117,7 +117,7 @@ def _product_from_buy_box(result: dict, client: MercadoLivreClient) -> Product |
         price=price,
         original_price=original_price,
         currency_id=winner.get("currency_id") or "BRL",
-        permalink=f"https://www.mercadolivre.com.br/p/{product_id}?wid={item_id}",
+        permalink=f"https://www.mercadolivre.com.br/p/{product_id}",
         picture=picture,
     )
 
