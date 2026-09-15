@@ -18,22 +18,129 @@ from app.affiliate import AffiliateClient, AffiliateError
 from app.config import settings
 
 
-def _affiliate_url(origin_url: str) -> str | None:
-    # Na consulta manual, nunca exibimos um link cru como se fosse link do Auvello.
-    # Se o modo de afiliado estiver desativado ou o portal falhar, o resultado
-    # continua visível, mas sem botão de compra.
+def _canonical_affiliate_candidates(
+    origin_url: str,
+    *,
+    product_id: str | None = None,
+    item_id: str | None = None,
+) -> list[str]:
+    """Monta URLs canônicas do Mercado Livre para o portal de afiliados.
+
+    A consulta manual pode descobrir a mesma oferta por catálogo, User Product,
+    anúncio comum ou resultado externo. Nenhum parâmetro de tracking (?wid,
+    matt_*, gclid etc.) é enviado ao gerador de afiliados.
+    """
+    raw = str(origin_url or "").strip()
+    candidates: list[str] = []
+
+    def add(url: str | None) -> None:
+        value = str(url or "").strip()
+        if not value or value in candidates:
+            return
+        try:
+            parsed = urlparse(value)
+            host = (parsed.hostname or "").lower()
+            if host != "mercadolivre.com.br" and not host.endswith(".mercadolivre.com.br"):
+                return
+        except Exception:
+            return
+        candidates.append(value)
+
+    pid = str(product_id or "").strip().upper()
+    iid = str(item_id or "").strip().upper()
+
+    # PRODUCT de catálogo: é exatamente o mesmo formato usado pela automação.
+    if re.fullmatch(r"MLB\d+", pid):
+        add(f"https://www.mercadolivre.com.br/p/{pid}")
+
+    # Aproveita identificadores expostos pelo próprio URL descoberto.
+    mlbu = None
+    url_item = None
+    if raw:
+        mlbu_match = re.search(r"\b(MLBU\d{5,})\b", raw, re.I)
+        if mlbu_match:
+            mlbu = mlbu_match.group(1).upper()
+        item_match = re.search(r"\b(MLB\d{5,})\b", raw, re.I)
+        if item_match:
+            url_item = item_match.group(1).upper()
+        try:
+            parsed = urlparse(raw)
+            params = parse_qs(parsed.query)
+            filters = " ".join(params.get("pdp_filters", []))
+            fm = re.search(r"item_id\s*[:=]\s*(MLB\d+)", unquote(filters), re.I)
+            if fm:
+                url_item = fm.group(1).upper()
+            fragment = unquote(parsed.fragment or "")
+            wm = re.search(r"(?:^|[&?])wid=(MLB\d+)", fragment, re.I)
+            if wm:
+                url_item = wm.group(1).upper()
+        except Exception:
+            pass
+
+    if not iid:
+        iid = url_item or ""
+
+    # User Product: usa o caminho canônico sem querystring/fragmento.
+    if mlbu:
+        add(f"https://www.mercadolivre.com.br/up/{mlbu}")
+
+    # Para anúncios comuns/URLs com slug, preserva somente host + path.
+    if raw:
+        try:
+            parsed = urlparse(raw)
+            host = (parsed.hostname or "").lower()
+            if host == "mercadolivre.com.br" or host.endswith(".mercadolivre.com.br"):
+                clean = f"https://{parsed.netloc}{parsed.path}".rstrip("/")
+                add(clean)
+        except Exception:
+            pass
+
+    # Último formato seguro para um item quando ele é tudo o que temos.
+    # Não adiciona tracking; o Mercado Livre pode redirecionar para a página atual.
+    if re.fullmatch(r"MLB\d+", iid):
+        digits = iid[3:]
+        add(f"https://produto.mercadolivre.com.br/MLB-{digits}-_JM")
+
+    return candidates
+
+
+def _affiliate_url(
+    origin_url: str,
+    *,
+    product_id: str | None = None,
+    item_id: str | None = None,
+) -> str | None:
+    # Na consulta manual, nunca exibimos link cru como se fosse afiliado.
     if settings.affiliate_mode == "disabled":
         return None
-    try:
-        return AffiliateClient().build(origin_url)
-    except AffiliateError as exc:
-        print(f"[manual-lookup/afiliado] {exc}", file=sys.stderr)
+
+    candidates = _canonical_affiliate_candidates(
+        origin_url,
+        product_id=product_id,
+        item_id=item_id,
+    )
+    if not candidates:
+        print(f"[manual-lookup/afiliado] nenhuma URL canônica para {origin_url}", file=sys.stderr)
         return None
+
+    client = AffiliateClient()
+    errors: list[str] = []
+    for candidate in candidates:
+        try:
+            short_url = client.build(candidate)
+            print(f"[manual-lookup/afiliado] OK origem={candidate}", file=sys.stderr)
+            return short_url
+        except AffiliateError as exc:
+            errors.append(f"{candidate} -> {exc}")
+
+    print(
+        "[manual-lookup/afiliado] todas as URLs foram rejeitadas: " + " | ".join(errors),
+        file=sys.stderr,
+    )
+    return None
 
 
 def _result(product: Product, *, search_rank: int | None = None) -> dict:
-    # O portal de afiliados é mais estável com a URL canônica do PRODUCT_ID.
-    # Mantemos item_id apenas como metadado da oferta; não anexamos ?wid= ao link.
     origin_url = f"https://www.mercadolivre.com.br/p/{product.product_id}"
     return {
         "product_id": product.product_id,
@@ -43,7 +150,11 @@ def _result(product: Product, *, search_rank: int | None = None) -> dict:
         "original_price": product.original_price,
         "discount_percent": product.discount_percent,
         "currency_id": product.currency_id,
-        "url": _affiliate_url(origin_url),
+        "url": _affiliate_url(
+            origin_url,
+            product_id=product.product_id,
+            item_id=product.item_id,
+        ),
         "picture": product.picture,
         "search_rank": search_rank,
     }
@@ -443,15 +554,25 @@ def _serper_marketplace_search(term: str, limit: int = 20) -> tuple[list[dict], 
 
 def _public_result(row: dict, *, search_rank: int | None = None) -> dict:
     origin_url = str(row.get("origin_url") or "").strip()
+    mlbu, item_id = _extract_reference_ids(origin_url) if origin_url else (None, None)
+    product_id = None
+    if origin_url:
+        pm = re.search(r"/p/(MLB\d+)", origin_url, re.I)
+        if pm:
+            product_id = pm.group(1).upper()
     return {
-        "product_id": None,
-        "item_id": None,
+        "product_id": product_id,
+        "item_id": item_id,
         "name": row.get("name"),
         "price": row.get("price"),
         "original_price": row.get("original_price"),
         "discount_percent": float(row.get("discount_percent") or 0.0),
         "currency_id": row.get("currency_id") or "BRL",
-        "url": _affiliate_url(origin_url) if origin_url else None,
+        "url": _affiliate_url(
+            origin_url,
+            product_id=product_id,
+            item_id=item_id,
+        ) if origin_url else None,
         "picture": row.get("picture"),
         "search_rank": search_rank,
     }
