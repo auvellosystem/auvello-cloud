@@ -16,6 +16,12 @@ app.use(express.json({ limit: "1mb" }));
 let sock = null;
 let ready = false;
 let latestQr = null;
+let whatsappState = "starting";
+let lastConnectedAt = null;
+let lastDisconnectedAt = null;
+let lastDisconnectReason = null;
+let connectionGeneration = 0;
+let reconnectTimer = null;
 const communityRate = new Map();
 const execFileAsync = promisify(execFile);
 
@@ -437,14 +443,21 @@ app.post("/api/community/requests", async (req, res) => {
 app.get("/admin", adminAuth, (_req, res) => {
   res.status(200).type("html").send(`<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Auvello Admin</title>
 <style>
-:root{color-scheme:dark;--bg:#090d0b;--panel:#111815;--green:#36e676;--text:#f3f7f4;--muted:#8fa298;--border:#26362e}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top,#14231b 0,#090d0b 40%);font-family:Inter,Arial,sans-serif;color:var(--text);min-height:100vh}.wrap{max-width:1180px;margin:0 auto;padding:28px 18px 70px}.brand{display:flex;gap:14px;align-items:center;margin-bottom:24px}.logo{width:48px;height:48px;border-radius:14px;background:linear-gradient(145deg,#48f98a,#168c48);display:grid;place-items:center;color:#07120b;font-size:25px;font-weight:900}.brand h1{margin:0;font-size:24px}.brand p{margin:4px 0 0;color:var(--muted)}.card{background:#111815e8;border:1px solid var(--border);border-radius:18px;padding:20px;margin-bottom:18px}h2{font-size:17px;margin:0 0 16px}.form{display:grid;grid-template-columns:minmax(190px,1.05fr) minmax(250px,1.15fr) minmax(360px,2fr) max-content;gap:10px;align-items:start}.form3{display:grid;grid-template-columns:1.5fr 1fr auto;gap:10px}input,select,textarea,button{border-radius:11px;border:1px solid var(--border);font:inherit}input,select,textarea{background:#0c120f;color:var(--text);padding:0 13px;outline:none}input,select{height:46px}textarea{padding:10px 13px;min-height:70px}button{height:46px;padding:0 17px;background:var(--green);color:#06200f;font-weight:800;cursor:pointer;border:none}#catAdd{min-width:118px;white-space:nowrap;align-self:start}button.secondary{background:#25332c;color:var(--text)}button.danger{background:#321b1b;color:#ffaaaa;border:1px solid #5e2b2b}.checks{display:flex;gap:16px;flex-wrap:wrap;margin:12px 0}.checks label{font-size:13px;color:#cbd6cf}.checks input{height:auto;width:auto}.msg{margin-top:12px;min-height:20px;color:var(--muted);font-size:14px}.msg.ok{color:var(--green)}.msg.err{color:#ff8d8d}.tablewrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:850px}th,td{text-align:left;padding:12px 9px;border-bottom:1px solid var(--border);font-size:13px;vertical-align:top}th{color:var(--muted);font-size:11px;text-transform:uppercase}.pill{display:inline-block;padding:5px 9px;border-radius:99px;font-size:12px;font-weight:700;background:#183425;color:#65f49c}.pill.off{background:#332828;color:#c7aaa9}.actions{display:flex;gap:7px;flex-wrap:wrap}.actions button{height:34px;padding:0 10px;font-size:12px}.empty{color:var(--muted);padding:18px 0}.hint{font-size:13px;color:var(--muted);margin-top:10px;line-height:1.5}.topline{display:flex;align-items:center;justify-content:space-between;gap:12px}.refresh{height:36px!important;background:#25332c!important;color:var(--text)!important}.request{border:1px solid var(--border);border-radius:15px;padding:15px;margin:11px 0;background:#0d1410}.request-head{display:flex;justify-content:space-between;gap:12px}.request h3{margin:0 0 5px;font-size:16px}.meta,.note{color:#aab9b0;font-size:12px;line-height:1.5}.note{margin-top:9px;font-size:13px}.request-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:13px}.request-grid label{display:block;color:var(--muted);font-size:11px;margin-bottom:5px}.request-grid input,.request-grid select{width:100%;height:40px}.community-actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:12px}.community-actions button{height:36px;font-size:12px}.cat-edit{display:grid;grid-template-columns:1fr 1fr;gap:6px}.cat-edit input,.cat-edit select{height:36px;width:100%}.lookup-backdrop{position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center;padding:18px;z-index:1000}.lookup-backdrop.open{display:flex}.lookup-modal{width:min(760px,100%);max-height:88vh;overflow:auto;background:#101713;border:1px solid var(--border);border-radius:18px;padding:18px;box-shadow:0 24px 80px #0009}.lookup-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px}.lookup-head h3{margin:0}.lookup-close{height:36px!important;background:#25332c!important;color:var(--text)!important}.lookup-results{display:grid;gap:10px}.lookup-item{border:1px solid var(--border);border-radius:13px;padding:13px;background:#0b120e}.lookup-item strong{display:block;margin-bottom:6px}.lookup-price{font-size:18px;font-weight:900}.lookup-meta{font-size:12px;color:var(--muted);margin-top:5px}.lookup-item a{display:inline-block;margin-top:9px;color:#72eda0;font-weight:800;text-decoration:none}.lookup-dispatch{margin-top:16px;padding-top:14px;border-top:1px solid var(--border);display:grid;grid-template-columns:minmax(220px,1fr) auto;gap:9px;align-items:end}.lookup-dispatch label{display:block;color:var(--muted);font-size:11px;margin-bottom:5px}.lookup-dispatch select{width:100%}.lookup-dispatch button{min-width:150px}.lookup-dispatch-status{grid-column:1/-1;min-height:18px;font-size:13px;color:var(--muted)}.lookup-dispatch-status.ok{color:var(--green)}.lookup-dispatch-status.err{color:#ff8d8d}@media(max-width:980px){.form{grid-template-columns:1fr 1fr}.form #catWhatsApp{grid-column:1/-1}.form #catAdd{grid-column:1/-1;width:100%}.form3{grid-template-columns:1fr}.request-grid{grid-template-columns:1fr}.cat-edit{grid-template-columns:1fr}}@media(max-width:650px){.form{grid-template-columns:1fr}.form #catWhatsApp,.form #catAdd{grid-column:auto}.lookup-dispatch{grid-template-columns:1fr}.lookup-dispatch button{width:100%}}
+:root{color-scheme:dark;--bg:#090d0b;--panel:#111815;--green:#36e676;--text:#f3f7f4;--muted:#8fa298;--border:#26362e}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top,#14231b 0,#090d0b 40%);font-family:Inter,Arial,sans-serif;color:var(--text);min-height:100vh}.wrap{max-width:1180px;margin:0 auto;padding:28px 18px 70px}.brand{display:flex;gap:14px;align-items:center;margin-bottom:24px}.logo{width:48px;height:48px;border-radius:14px;background:linear-gradient(145deg,#48f98a,#168c48);display:grid;place-items:center;color:#07120b;font-size:25px;font-weight:900}.brand h1{margin:0;font-size:24px}.brand p{margin:4px 0 0;color:var(--muted)}.card{background:#111815e8;border:1px solid var(--border);border-radius:18px;padding:20px;margin-bottom:18px}h2{font-size:17px;margin:0 0 16px}.form{display:grid;grid-template-columns:minmax(190px,1.05fr) minmax(250px,1.15fr) minmax(360px,2fr) max-content;gap:10px;align-items:start}.form3{display:grid;grid-template-columns:1.5fr 1fr auto;gap:10px}input,select,textarea,button{border-radius:11px;border:1px solid var(--border);font:inherit}input,select,textarea{background:#0c120f;color:var(--text);padding:0 13px;outline:none}input,select{height:46px}textarea{padding:10px 13px;min-height:70px}button{height:46px;padding:0 17px;background:var(--green);color:#06200f;font-weight:800;cursor:pointer;border:none}#catAdd{min-width:118px;white-space:nowrap;align-self:start}button.secondary{background:#25332c;color:var(--text)}button.danger{background:#321b1b;color:#ffaaaa;border:1px solid #5e2b2b}.checks{display:flex;gap:16px;flex-wrap:wrap;margin:12px 0}.checks label{font-size:13px;color:#cbd6cf}.checks input{height:auto;width:auto}.msg{margin-top:12px;min-height:20px;color:var(--muted);font-size:14px}.msg.ok{color:var(--green)}.msg.err{color:#ff8d8d}.tablewrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:850px}th,td{text-align:left;padding:12px 9px;border-bottom:1px solid var(--border);font-size:13px;vertical-align:top}th{color:var(--muted);font-size:11px;text-transform:uppercase}.pill{display:inline-block;padding:5px 9px;border-radius:99px;font-size:12px;font-weight:700;background:#183425;color:#65f49c}.pill.off{background:#332828;color:#c7aaa9}.actions{display:flex;gap:7px;flex-wrap:wrap}.actions button{height:34px;padding:0 10px;font-size:12px}.empty{color:var(--muted);padding:18px 0}.hint{font-size:13px;color:var(--muted);margin-top:10px;line-height:1.5}.topline{display:flex;align-items:center;justify-content:space-between;gap:12px}.refresh{height:36px!important;background:#25332c!important;color:var(--text)!important}.request{border:1px solid var(--border);border-radius:15px;padding:15px;margin:11px 0;background:#0d1410}.request-head{display:flex;justify-content:space-between;gap:12px}.request h3{margin:0 0 5px;font-size:16px}.meta,.note{color:#aab9b0;font-size:12px;line-height:1.5}.note{margin-top:9px;font-size:13px}.request-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:13px}.request-grid label{display:block;color:var(--muted);font-size:11px;margin-bottom:5px}.request-grid input,.request-grid select{width:100%;height:40px}.community-actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:12px}.community-actions button{height:36px;font-size:12px}.cat-edit{display:grid;grid-template-columns:1fr 1fr;gap:6px}.cat-edit input,.cat-edit select{height:36px;width:100%}.lookup-backdrop{position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center;padding:18px;z-index:1000}.lookup-backdrop.open{display:flex}.lookup-modal{width:min(760px,100%);max-height:88vh;overflow:auto;background:#101713;border:1px solid var(--border);border-radius:18px;padding:18px;box-shadow:0 24px 80px #0009}.lookup-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px}.lookup-head h3{margin:0}.lookup-close{height:36px!important;background:#25332c!important;color:var(--text)!important}.lookup-results{display:grid;gap:10px}.lookup-item{border:1px solid var(--border);border-radius:13px;padding:13px;background:#0b120e}.lookup-item strong{display:block;margin-bottom:6px}.lookup-price{font-size:18px;font-weight:900}.lookup-meta{font-size:12px;color:var(--muted);margin-top:5px}.lookup-item a{display:inline-block;margin-top:9px;color:#72eda0;font-weight:800;text-decoration:none}.lookup-dispatch{margin-top:16px;padding-top:14px;border-top:1px solid var(--border);display:grid;grid-template-columns:minmax(220px,1fr) auto;gap:9px;align-items:end}.lookup-dispatch label{display:block;color:var(--muted);font-size:11px;margin-bottom:5px}.lookup-dispatch select{width:100%}.lookup-dispatch button{min-width:150px}.lookup-dispatch-status{grid-column:1/-1;min-height:18px;font-size:13px;color:var(--muted)}.lookup-dispatch-status.ok{color:var(--green)}.lookup-dispatch-status.err{color:#ff8d8d}.wa-status-grid{display:grid;grid-template-columns:minmax(220px,1fr) minmax(260px,1.2fr);gap:16px;align-items:start}.wa-status-box{border:1px solid var(--border);border-radius:14px;padding:15px;background:#0c120f}.wa-status-line{display:flex;align-items:center;gap:10px;font-weight:900;font-size:17px}.wa-dot{width:12px;height:12px;border-radius:50%;background:#78847d;box-shadow:0 0 0 4px #ffffff0a}.wa-dot.connected{background:#36e676;box-shadow:0 0 0 4px #36e6761f}.wa-dot.qr_ready{background:#f5c84b}.wa-dot.reconnecting,.wa-dot.connecting,.wa-dot.resetting{background:#f59e42}.wa-dot.disconnected,.wa-dot.logged_out{background:#ff6969}.wa-meta{margin-top:9px;color:var(--muted);font-size:12px;line-height:1.6}.wa-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:13px}.wa-actions button{height:38px;font-size:12px}.wa-qr{text-align:center}.wa-qr img{width:min(320px,100%);background:#fff;border-radius:12px;padding:10px}.wa-qr .empty{padding:12px 0}@media(max-width:980px){.form{grid-template-columns:1fr 1fr}.form #catWhatsApp{grid-column:1/-1}.form #catAdd{grid-column:1/-1;width:100%}.form3{grid-template-columns:1fr}.request-grid{grid-template-columns:1fr}.cat-edit{grid-template-columns:1fr}}@media(max-width:700px){.wa-status-grid{grid-template-columns:1fr}}@media(max-width:650px){.form{grid-template-columns:1fr}.form #catWhatsApp,.form #catAdd{grid-column:auto}.lookup-dispatch{grid-template-columns:1fr}.lookup-dispatch button{width:100%}}
 </style></head><body><div class="wrap"><div class="brand"><div class="logo">A</div><div><h1>Auvello Admin</h1><p>Categorias, grupos, produtos fixados e pedidos da comunidade</p></div></div>
+<section class="card"><div class="topline"><div><h2>WhatsApp do Auvello</h2><div class="hint" style="margin-top:-8px">Acompanhe a conexão e, se necessário, vincule novamente pelo QR Code sem sair da Admin.</div></div><button class="refresh" id="waRefresh">Atualizar</button></div><div class="wa-status-grid"><div class="wa-status-box"><div class="wa-status-line"><span id="waDot" class="wa-dot"></span><span id="waStatusText">Consultando...</span></div><div id="waStatusMeta" class="wa-meta"></div><div class="wa-actions"><button id="waReconnect" class="secondary">Reconectar</button><button id="waNewQr">Gerar novo QR</button></div><div id="waMessage" class="msg"></div></div><div class="wa-status-box wa-qr"><div id="waQrArea" class="empty">QR Code aparecerá aqui quando for necessário.</div></div></div></section>
 <section class="card"><h2>Categorias e grupos</h2><div class="form"><input id="catName" placeholder="Nome da nova categoria"><textarea id="catSearch" placeholder="Buscas automáticas (opcional) — uma por linha ou separadas por vírgula"></textarea><select id="catWhatsApp"><option value="">Sem grupo por enquanto</option></select><button id="catAdd">+ CRIAR</button></div><div class="checks"><label><input type="checkbox" id="catPublic" checked> Exibir no formulário público</label><label><input type="checkbox" id="catMirror" checked> Espelhar ofertas no Geral</label></div><div class="hint">Crie o grupo no WhatsApp, depois selecione-o aqui. Em “Buscas automáticas”, você pode cadastrar até 15 termos, um por linha ou separados por vírgula/ponto e vírgula. Cada termo será pesquisado separadamente e os resultados serão reunidos nesta categoria. Sem termos, a categoria ainda pode receber produtos fixados e pedidos aprovados.</div><div id="catMessage" class="msg"></div><div class="tablewrap"><div id="categories" class="empty">Carregando...</div></div></section>
 <section class="card"><h2>Adicionar produto ao monitoramento permanente</h2><div class="form3"><input id="product" placeholder="MLB29089153 ou link completo do Mercado Livre"><select id="group"></select><button id="add">+ ADICIONAR</button></div><div class="hint">O produto continua precisando passar pelos critérios atuais. O grupo Geral não é selecionável: ofertas específicas podem ser espelhadas para ele automaticamente.</div><div id="message" class="msg"></div></section>
 <section class="card"><div class="topline"><h2>Produtos fixados</h2><button class="refresh" id="refresh">Atualizar</button></div><div class="tablewrap"><div id="content" class="empty">Carregando...</div></div></section>
 <section class="card"><div class="topline"><div><h2>Pedidos da Comunidade</h2><div class="hint" style="margin-top:-8px">O cliente recebe uma consulta automática no WhatsApp ao enviar o pedido. A solicitação continua pendente aqui; ao aprovar, o termo entra nas buscas automáticas.</div></div><button class="refresh" id="refreshRequests">Atualizar</button></div><div id="requests" class="empty">Carregando...</div></section>
 </div><div id="lookupBackdrop" class="lookup-backdrop"><div class="lookup-modal"><div class="lookup-head"><h3 id="lookupTitle">Consulta</h3><button id="lookupClose" class="lookup-close">Fechar</button></div><div id="lookupBody" class="lookup-results"></div><div id="lookupDispatch" class="lookup-dispatch" style="display:none"><div><label for="lookupGroup">Enviar ofertas para</label><select id="lookupGroup"></select></div><button id="lookupSend">DISPARAR OFERTAS</button><div id="lookupDispatchStatus" class="lookup-dispatch-status"></div></div></div></div><script>
 const $=id=>document.getElementById(id);const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));const fmtDate=v=>v?new Date(v).toLocaleString('pt-BR'):'—';const money=v=>v==null?'—':Number(v).toLocaleString('pt-BR',{style:'currency',currency:'BRL'});async function api(url,options={}){const r=await fetch(url,{headers:{'Content-Type':'application/json',...(options.headers||{})},...options});const d=await r.json().catch(()=>({}));if(!r.ok){const e=new Error(d.error||'Erro na requisição');e.status=r.status;e.data=d;throw e;}return d;}
+let WA_STATUS_TIMER=null;
+const WA_STATE_LABELS={starting:'INICIANDO',connecting:'CONECTANDO',connected:'CONECTADO',qr_ready:'AGUARDANDO QR CODE',reconnecting:'RECONECTANDO',disconnected:'DESCONECTADO',logged_out:'SESSÃO ENCERRADA',resetting:'PREPARANDO NOVO QR'};
+async function loadWhatsappStatus(){try{const d=await api('/api/admin/whatsapp-status');const state=d.state||'disconnected';$('waDot').className='wa-dot '+state;$('waStatusText').textContent=WA_STATE_LABELS[state]||state.toUpperCase();const meta=[];if(d.last_connected_at)meta.push('Última conexão: '+fmtDate(d.last_connected_at));if(d.last_disconnected_at)meta.push('Última desconexão: '+fmtDate(d.last_disconnected_at));if(d.last_disconnect_reason)meta.push('Motivo: '+d.last_disconnect_reason);$('waStatusMeta').innerHTML=meta.map(esc).join('<br>')||'Status atualizado agora.';$('waReconnect').disabled=Boolean(d.ready);if(d.ready){$('waQrArea').innerHTML='<div class="empty">✅ WhatsApp conectado. Nenhum QR necessário.</div>';}else if(d.has_qr){await loadWhatsappQr();}else{$('waQrArea').innerHTML='<div class="empty">'+(state==='reconnecting'||state==='connecting'?'Tentando reconectar...':'Aguardando geração do QR Code...')+'</div>';}return d;}catch(e){$('waStatusText').textContent='ERRO AO CONSULTAR';$('waDot').className='wa-dot disconnected';$('waMessage').className='msg err';$('waMessage').textContent=e.message;return null;}}
+async function loadWhatsappQr(){try{const d=await api('/api/admin/whatsapp-qr');if(d.ready){$('waQrArea').innerHTML='<div class="empty">✅ WhatsApp conectado. Nenhum QR necessário.</div>';return;}if(d.data_url){$('waQrArea').innerHTML='<div class="hint" style="margin:0 0 10px">No WhatsApp: Aparelhos conectados → Conectar aparelho.</div><img alt="QR Code do WhatsApp" src="'+esc(d.data_url)+'">';}else{$('waQrArea').innerHTML='<div class="empty">QR ainda não disponível. Atualizando automaticamente...</div>';}}catch(e){$('waQrArea').innerHTML='<div class="empty">'+esc(e.message)+'</div>';}}
+async function reconnectWhatsapp(newSession=false){if(newSession&&!confirm('Gerar um novo QR encerra a sessão salva do WhatsApp no Auvello. Continuar?'))return;const button=newSession?$('waNewQr'):$('waReconnect');const original=button.textContent;button.disabled=true;button.textContent=newSession?'PREPARANDO...':'RECONECTANDO...';$('waMessage').className='msg';$('waMessage').textContent='';try{await api('/api/admin/whatsapp-reconnect',{method:'POST',body:JSON.stringify({newSession})});$('waMessage').className='msg ok';$('waMessage').textContent=newSession?'Nova sessão iniciada. Aguarde o QR Code aparecer.':'Tentativa de reconexão iniciada.';setTimeout(loadWhatsappStatus,1000);}catch(e){$('waMessage').className='msg err';$('waMessage').textContent=e.message;}finally{button.disabled=false;button.textContent=original;}}
+$('waRefresh').onclick=loadWhatsappStatus;$('waReconnect').onclick=()=>reconnectWhatsapp(false);$('waNewQr').onclick=()=>reconnectWhatsapp(true);
 let CURRENT_LOOKUP_RESULTS=[];
 function preferredGeneralGroupId(){const exact=WA_GROUPS.find(g=>/^auvello\s*-?\s*geral$/i.test(String(g.subject||'').trim()));if(exact)return exact.id;const geral=WA_GROUPS.find(g=>/\bgeral\b/i.test(String(g.subject||'')));return geral?.id||'';}
 function lookupGroupOptions(){const preferred=preferredGeneralGroupId();return WA_GROUPS.map(g=>'<option value="'+esc(g.id)+'" '+(g.id===preferred?'selected':'')+'>'+esc(g.subject)+' — '+esc(g.id)+'</option>').join('');}
@@ -462,7 +475,7 @@ async function addProduct(){const value=$('product').value.trim(),groupKey=$('gr
 const statusInfo={pendente:'PENDENTE',em_analise:'EM ANÁLISE',aprovado:'APROVADO',rejeitado:'REJEITADO',precisa_contato:'PRECISA CONTATO'};function digits(v){const d=String(v||'').replace(/\D/g,'');return(d.length===10||d.length===11)?'55'+d:d;}
 async function loadRequests(){try{const d=await api('/api/admin/community-requests');const M=catMap();if(!d.requests.length){$('requests').innerHTML='<div class="empty">Nenhuma solicitação.</div>';return;}$('requests').innerHTML=d.requests.map(r=>{const group=r.approved_group_key||r.suggested_group_key;const search=r.approved_search_term||r.desired_item||'';const ref=r.reference_url?'<div class="note"><strong>Link:</strong> <a target="_blank" style="color:#72eda0" href="'+esc(r.reference_url)+'">abrir referência</a></div>':'';const pedido=r.desired_item?'<div class="note"><strong>Pedido:</strong> '+esc(r.desired_item)+'</div>':'<div class="note"><strong>Pedido:</strong> somente link de referência</div>';const instantLabel=r.instant_response_status==='enviado'?'✅ Resposta automática: '+Number(r.instant_lookup_count||0)+' resultado(s), enviada em '+fmtDate(r.instant_response_at):r.instant_response_status==='sem_resultado'?'🔎 Resposta automática: nenhuma oferta relevante encontrada em '+fmtDate(r.instant_response_at):r.instant_response_status==='sem_link_afiliado'?'⚠️ Resposta automática: resultados encontrados, mas sem link afiliado disponível':r.instant_response_status?'⚠️ Resposta automática falhou'+(r.instant_response_error?' — '+esc(r.instant_response_error):''):'⏳ Resposta automática ainda não registrada';const instantNote='<div class="note"><strong>'+instantLabel+'</strong></div>';return '<div class="request" data-request="'+r.id+'"><div class="request-head"><div><h3>#'+r.id+' — '+esc(r.name)+'</h3><div class="meta">'+fmtDate(r.created_at)+' · <a style="color:#72eda0" target="_blank" href="https://wa.me/'+esc(digits(r.whatsapp))+'">'+esc(r.whatsapp)+'</a></div></div><span class="pill">'+esc(statusInfo[r.status]||r.status)+'</span></div>'+pedido+ref+instantNote+'<div class="note"><strong>Categoria sugerida:</strong> '+esc(M[r.suggested_group_key]||r.suggested_group_key)+'</div>'+(r.notes?'<div class="note"><strong>Observação:</strong> '+esc(r.notes)+'</div>':'')+'<div class="request-grid"><div><label>Termo que o Auvello pesquisará</label><input data-f="search" maxlength="180" value="'+esc(search)+'" placeholder="Digite manualmente se o usuário enviou só o link"></div><div><label>Categoria validada</label><select data-f="group">'+activeOptions(group)+'</select></div></div><div class="community-actions"><button class="secondary" data-status="em_analise">Em análise</button><button data-status="aprovado">Aprovar</button><button class="secondary" data-status="precisa_contato">Precisa contato</button><button class="danger" data-status="rejeitado">Rejeitar</button></div></div>';}).join('');$('requests').querySelectorAll('[data-request]').forEach(card=>card.querySelectorAll('[data-status]').forEach(b=>b.onclick=()=>updateRequest(card,b.dataset.status)));}catch(e){$('requests').innerHTML='<div class="empty">Erro: '+esc(e.message)+'</div>';}}
 async function updateRequest(card,status){const search=card.querySelector('[data-f="search"]').value.trim(),groupKey=card.querySelector('[data-f="group"]').value;const button=card.querySelector('[data-status="'+status+'"]');const original=button?.textContent;if(button&&status==='aprovado'){button.disabled=true;button.textContent='Consultando...';}try{const d=await api('/api/admin/community-requests/'+card.dataset.request,{method:'PATCH',body:JSON.stringify({status,approvedSearchTerm:search,approvedGroupKey:groupKey})});if(status==='aprovado')showLookup('Consulta após aprovação — '+search,d.lookup,d.lookup_error);await loadRequests();}catch(e){alert(e.message);}finally{if(button){button.disabled=false;if(original)button.textContent=original;}}}
-$('catAdd').onclick=createCategory;$('add').onclick=addProduct;$('refresh').onclick=loadProducts;$('refreshRequests').onclick=loadRequests;(async()=>{await loadWhatsAppGroups();await loadCategories();await loadProducts();await loadRequests();})();
+$('catAdd').onclick=createCategory;$('add').onclick=addProduct;$('refresh').onclick=loadProducts;$('refreshRequests').onclick=loadRequests;(async()=>{await loadWhatsappStatus();WA_STATUS_TIMER=setInterval(loadWhatsappStatus,5000);await loadWhatsAppGroups();await loadCategories();await loadProducts();await loadRequests();})();
 </script></body></html>`);
 });
 
@@ -523,6 +536,66 @@ app.patch("/api/admin/categories/:id", adminAuth, async (req, res) => {
 app.delete("/api/admin/categories/:id", adminAuth, async (req,res)=>{
   const id=Number(req.params.id);if(!Number.isInteger(id)||id<=0)return res.status(400).json({error:"ID inválido."});
   try{await ensureAdminTable();const {rows}=await adminPool.query("SELECT group_key FROM auvello_categories WHERE id=$1 LIMIT 1",[id]);if(!rows[0])return res.status(404).json({error:"Categoria não encontrada."});const key=rows[0].group_key;const used=await adminPool.query(`SELECT (SELECT COUNT(*) FROM admin_monitored_products WHERE group_key=$1) + (SELECT COUNT(*) FROM community_requests WHERE suggested_group_key=$1 OR approved_group_key=$1) AS total`,[key]);if(Number(used.rows[0]?.total||0)>0)return res.status(409).json({error:"Esta categoria já está em uso. Pause-a em vez de excluir, ou remova/mova os registros associados."});await adminPool.query("DELETE FROM auvello_categories WHERE id=$1",[id]);res.json({ok:true});}catch(error){console.error("[admin/categories] delete:",error);res.status(500).json({error:"Não foi possível excluir a categoria."});}
+});
+
+app.get("/api/admin/whatsapp-status", adminAuth, (_req,res)=>{
+  res.json({
+    ready,
+    state: whatsappState,
+    has_qr: Boolean(latestQr),
+    last_connected_at: lastConnectedAt,
+    last_disconnected_at: lastDisconnectedAt,
+    last_disconnect_reason: lastDisconnectReason
+  });
+});
+
+app.get("/api/admin/whatsapp-qr", adminAuth, async (_req,res)=>{
+  if(ready)return res.json({ready:true,data_url:null});
+  if(!latestQr)return res.json({ready:false,data_url:null,state:whatsappState});
+  try{
+    const dataUrl=await QRCode.toDataURL(latestQr,{errorCorrectionLevel:"M",margin:2,width:420});
+    res.json({ready:false,data_url:dataUrl,state:whatsappState});
+  }catch(error){
+    console.error("[admin/whatsapp] qr:",error);
+    res.status(500).json({error:"Não foi possível gerar o QR Code agora."});
+  }
+});
+
+async function clearWhatsAppAuth(){
+  if(databaseUrl){
+    await ensureAdminTable();
+    await adminPool.query("DELETE FROM whatsapp_auth");
+  }else{
+    try{fs.rmSync("auth_info",{recursive:true,force:true});}catch(_error){}
+  }
+}
+
+async function restartWhatsApp({newSession=false}={}){
+  connectionGeneration+=1;
+  if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null;}
+  ready=false;
+  latestQr=null;
+  whatsappState=newSession?"resetting":"reconnecting";
+  const currentSock=sock;
+  sock=null;
+  try{currentSock?.end?.(new Error(newSession?"Nova sessão solicitada pelo Admin":"Reconexão solicitada pelo Admin"));}catch(_error){}
+  if(newSession){
+    await new Promise(resolve=>setTimeout(resolve,350));
+    await clearWhatsAppAuth();
+  }
+  await connectWhatsApp();
+}
+
+app.post("/api/admin/whatsapp-reconnect", adminAuth, async (req,res)=>{
+  const newSession=Boolean(req.body?.newSession);
+  try{
+    if(ready&&!newSession)return res.json({ok:true,already_connected:true});
+    await restartWhatsApp({newSession});
+    res.json({ok:true,state:whatsappState});
+  }catch(error){
+    console.error("[admin/whatsapp] reconnect:",error);
+    res.status(500).json({error:"Não foi possível iniciar a conexão do WhatsApp."});
+  }
 });
 
 app.get("/api/admin/whatsapp-groups", adminAuth, async (_req,res)=>{
@@ -647,7 +720,50 @@ app.patch("/api/admin/community-requests/:id", adminAuth, async (req,res)=>{
   }
 });
 
-async function connectWhatsApp(){const db=process.env.DATABASE_URL?.trim();const authProvider=db?await useNeonAuthState(db):await useMultiFileAuthState("auth_info");const{state,saveCreds}=authProvider;console.log(db?"[whatsapp] sessao persistida no PostgreSQL/Neon.":"[whatsapp] DATABASE_URL ausente; usando auth_info local.");sock=makeWASocket({auth:state,logger:pino({level:"silent"}),printQRInTerminal:false,syncFullHistory:false,markOnlineOnConnect:false});sock.ev.on("creds.update",saveCreds);sock.ev.on("connection.update",({connection,lastDisconnect,qr})=>{if(qr){latestQr=qr;console.log("\nQR Code atualizado. Abra /qr?key=SEU_QR_SECRET no navegador.\n");qrcodeTerminal.generate(qr,{small:true});}if(connection==="open"){ready=true;latestQr=null;console.log("WhatsApp conectado.");}if(connection==="close"){ready=false;latestQr=null;const error=lastDisconnect?.error;const statusCode=error instanceof Boom?error.output?.statusCode:undefined;const shouldReconnect=statusCode!==DisconnectReason.loggedOut;console.log("WhatsApp desconectado.",shouldReconnect?"Reconectando...":"Sessao encerrada.");if(shouldReconnect)setTimeout(connectWhatsApp,3000);}});}
+async function connectWhatsApp(){
+  const generation=++connectionGeneration;
+  if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null;}
+  whatsappState="connecting";
+  const db=process.env.DATABASE_URL?.trim();
+  const authProvider=db?await useNeonAuthState(db):await useMultiFileAuthState("auth_info");
+  const{state,saveCreds}=authProvider;
+  console.log(db?"[whatsapp] sessao persistida no PostgreSQL/Neon.":"[whatsapp] DATABASE_URL ausente; usando auth_info local.");
+  const currentSock=makeWASocket({auth:state,logger:pino({level:"silent"}),printQRInTerminal:false,syncFullHistory:false,markOnlineOnConnect:false});
+  sock=currentSock;
+  currentSock.ev.on("creds.update",saveCreds);
+  currentSock.ev.on("connection.update",({connection,lastDisconnect,qr})=>{
+    if(generation!==connectionGeneration)return;
+    if(qr){
+      latestQr=qr;
+      ready=false;
+      whatsappState="qr_ready";
+      console.log("\nQR Code atualizado. Disponível também na página /admin.\n");
+      qrcodeTerminal.generate(qr,{small:true});
+    }
+    if(connection==="open"){
+      ready=true;
+      latestQr=null;
+      whatsappState="connected";
+      lastConnectedAt=new Date().toISOString();
+      lastDisconnectReason=null;
+      console.log("WhatsApp conectado.");
+    }
+    if(connection==="close"){
+      ready=false;
+      latestQr=null;
+      lastDisconnectedAt=new Date().toISOString();
+      const error=lastDisconnect?.error;
+      const statusCode=error instanceof Boom?error.output?.statusCode:undefined;
+      const shouldReconnect=statusCode!==DisconnectReason.loggedOut;
+      lastDisconnectReason=statusCode?`Código ${statusCode}`:(error?.message||"Conexão encerrada");
+      whatsappState=shouldReconnect?"reconnecting":"logged_out";
+      console.log("WhatsApp desconectado.",shouldReconnect?"Reconectando...":"Sessao encerrada.");
+      if(shouldReconnect){
+        reconnectTimer=setTimeout(()=>{if(generation===connectionGeneration)connectWhatsApp().catch(err=>console.error("[whatsapp] reconnect:",err));},3000);
+      }
+    }
+  });
+}
 app.get("/health",(_req,res)=>res.json({ok:true,whatsappReady:ready}));
 app.get("/qr",async(req,res)=>{const configuredSecret=process.env.QR_SECRET?.trim(),supplied=String(req.query.key||"").trim();if(!configuredSecret||supplied!==configuredSecret)return res.status(401).send("Nao autorizado.");if(ready)return res.status(200).type("html").send("<h2>WhatsApp conectado ✅</h2>");if(!latestQr)return res.status(200).type("html").send('<meta http-equiv="refresh" content="3"><h2>Aguardando QR Code...</h2>');try{const dataUrl=await QRCode.toDataURL(latestQr,{errorCorrectionLevel:"M",margin:2,width:420});return res.status(200).type("html").send(`<h2>Conectar WhatsApp ao Auvello</h2><img src="${dataUrl}" style="max-width:100%">`);}catch(error){return res.status(500).send("Nao foi possivel gerar o QR Code.");}});
 function lookupDispatchMessage(result){
