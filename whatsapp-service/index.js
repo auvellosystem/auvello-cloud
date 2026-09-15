@@ -358,18 +358,17 @@ app.get("/pedir-oferta", async (_req, res) => {
 <div class="card"><div class="grid">
 <div><label for="name">Nome</label><input id="name" maxlength="80" autocomplete="name" placeholder="Seu nome"></div>
 <div><label for="whatsapp">WhatsApp para receber as ofertas</label><input id="whatsapp" maxlength="30" inputmode="tel" autocomplete="tel" placeholder="(27) 99999-9999"><div class="help"><strong>O Auvello pesquisará agora e enviará os resultados desta solicitação para este número. Seu pedido também ficará pendente para análise.</strong></div></div>
-<div class="full notice"><strong>Informe pelo menos uma das duas opções abaixo:</strong> descreva o que procura <strong>ou</strong> cole um link do Mercado Livre. Você também pode preencher os dois.</div>
-<div class="full"><label for="desiredItem">O que você gostaria que o Auvello buscasse? (opcional se enviar link)</label><input id="desiredItem" maxlength="180" placeholder="Ex.: SSD NVMe 1TB, ração para gatos adultos, Air Fryer 5L"></div>
-<div class="full"><label for="referenceUrl">Link de referência do Mercado Livre (opcional se descrever)</label><input id="referenceUrl" maxlength="2000" inputmode="url" placeholder="https://www.mercadolivre.com.br/..."><div class="help">Se você só tiver o link, pode enviar assim. O Auvello poderá definir manualmente o termo de busca durante a análise.</div></div>
+<div class="full notice"><strong>Cole abaixo o link do produto no Mercado Livre.</strong> A Auvello usará esse produto como referência, pesquisará as melhores opções disponíveis e enviará os resultados para seu WhatsApp.</div>
+<div class="full"><label for="referenceUrl">Link do produto no Mercado Livre</label><input id="referenceUrl" maxlength="2000" inputmode="url" placeholder="https://www.mercadolivre.com.br/..."><div class="help">Abra o produto no Mercado Livre, copie o link e cole aqui.</div></div>
 <div><label for="groupKey">Categoria / grupo sugerido</label><select id="groupKey">${options}</select><div class="help">É apenas uma sugestão e pode ser ajustada na análise.</div></div>
 <div><label for="notes">Observação (opcional)</label><textarea id="notes" maxlength="500" placeholder="Ex.: prefiro pacote de 10 kg ou mais"></textarea></div>
 <div class="honeypot"><input id="company" tabindex="-1" autocomplete="off"></div>
-<div class="full notice"><strong>Importante:</strong> o link é referência. A solicitação não garante o monitoramento daquele anúncio específico. Se aprovada, o Auvello transforma o pedido em um termo de busca associado à categoria correta.</div>
+<div class="full notice"><strong>Importante:</strong> o link serve como referência do produto. A Auvello pode encontrar outras ofertas do mesmo produto ou de opções equivalentes e, se o pedido for aprovado, poderá continuar monitorando esse produto.</div>
 <div class="full"><button id="send">BUSCAR MINHA OFERTA</button><div id="message" class="msg"></div></div>
 </div></div></div>
 <script>
 const $=id=>document.getElementById(id);const msg=(t,k='')=>{$('message').textContent=t;$('message').className='msg '+k;};
-$('send').addEventListener('click',async()=>{const payload={name:$('name').value.trim(),whatsapp:$('whatsapp').value.trim(),referenceUrl:$('referenceUrl').value.trim(),desiredItem:$('desiredItem').value.trim(),groupKey:$('groupKey').value,notes:$('notes').value.trim(),company:$('company').value};if(!payload.name||!payload.whatsapp)return msg('Preencha nome e WhatsApp.','err');if(!payload.referenceUrl&&!payload.desiredItem)return msg('Informe o que deseja encontrar ou um link do Mercado Livre.','err');if(!payload.groupKey)return msg('Selecione uma categoria.','err');$('send').disabled=true;msg('Pesquisando ofertas e preparando o envio para seu WhatsApp...');try{const r=await fetch('/api/community/requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||'Não foi possível enviar.');if(d.instant?.status==='enviado')msg('Pronto! '+(d.instant.sent||0)+' oferta(s) enviada(s) para seu WhatsApp. Seu pedido também ficou pendente para análise.','ok');else if(d.instant?.status==='sem_resultado')msg('Pedido registrado. Não encontramos uma oferta relevante agora; ele ficou pendente para análise.','ok');else if(d.instant?.status==='sem_link_afiliado')msg('Pedido registrado. Encontramos resultados, mas os links não puderam ser preparados agora. O pedido ficou pendente para análise.','ok');else msg('Pedido registrado para análise. Não foi possível entregar a resposta automática no WhatsApp agora.','ok');$('referenceUrl').value='';$('desiredItem').value='';$('notes').value='';}catch(e){msg(e.message,'err');}finally{$('send').disabled=false;}});
+$('send').addEventListener('click',async()=>{const payload={name:$('name').value.trim(),whatsapp:$('whatsapp').value.trim(),referenceUrl:$('referenceUrl').value.trim(),groupKey:$('groupKey').value,notes:$('notes').value.trim(),company:$('company').value};if(!payload.name||!payload.whatsapp)return msg('Preencha nome e WhatsApp.','err');if(!payload.referenceUrl)return msg('Cole o link do produto no Mercado Livre.','err');if(!payload.groupKey)return msg('Selecione uma categoria.','err');$('send').disabled=true;msg('Pesquisando ofertas e preparando o envio para seu WhatsApp...');try{const r=await fetch('/api/community/requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||'Não foi possível enviar.');if(d.instant?.status==='enviado')msg('Pronto! '+(d.instant.sent||0)+' oferta(s) enviada(s) para seu WhatsApp. Seu pedido também ficou pendente para análise.','ok');else if(d.instant?.status==='sem_resultado')msg('Pedido registrado. Não encontramos ofertas para esse produto agora; ele ficou pendente para análise.','ok');else if(d.instant?.status==='sem_link_afiliado')msg('Pedido registrado. Encontramos resultados, mas os links não puderam ser preparados agora. O pedido ficou pendente para análise.','ok');else msg('Pedido registrado para análise. Não foi possível entregar a resposta automática no WhatsApp agora.','ok');$('referenceUrl').value='';$('notes').value='';}catch(e){msg(e.message,'err');}finally{$('send').disabled=false;}});
 </script></body></html>`);
 });
 
@@ -380,12 +379,12 @@ app.post("/api/community/requests", async (req, res) => {
   const whatsapp = normalizeWhatsapp(req.body?.whatsapp);
   const rawReference = String(req.body?.referenceUrl || "").trim();
   const referenceUrl = rawReference ? validateMercadoLivreUrl(rawReference) : null;
-  const desiredItem = normalizeText(req.body?.desiredItem, 180);
+  const desiredItem = "";
   const suggestedGroupKey = String(req.body?.groupKey || "").trim();
   const notes = normalizeText(req.body?.notes, 500) || null;
   if (name.length < 2) return res.status(400).json({ error: "Informe seu nome." });
   if (whatsapp.replace(/\D/g, "").length < 10) return res.status(400).json({ error: "Informe um WhatsApp válido para receber as ofertas." });
-  if (!desiredItem && !rawReference) return res.status(400).json({ error: "Informe o que deseja encontrar ou um link do Mercado Livre." });
+  if (!rawReference) return res.status(400).json({ error: "Cole o link do produto no Mercado Livre." });
   if (rawReference && !referenceUrl) return res.status(400).json({ error: "O link informado não é um link válido do Mercado Livre." });
   const category = await getCategoryByKey(suggestedGroupKey, { activeOnly: true }).catch(() => null);
   if (!category || !category.public_visible) return res.status(400).json({ error: "Categoria sugerida inválida." });
@@ -394,7 +393,7 @@ app.post("/api/community/requests", async (req, res) => {
     await ensureAdminTable();
     const referenceProductId = referenceUrl ? extractProductId(referenceUrl) : null;
     const urlSearchTerm = searchTermFromReferenceUrl(referenceUrl);
-    let instantSearchTerm = desiredItem || urlSearchTerm || "";
+    let instantSearchTerm = urlSearchTerm || "";
     if (looksLikeUrl(instantSearchTerm)) instantSearchTerm = urlSearchTerm;
 
     const { rows } = await adminPool.query(
@@ -404,7 +403,7 @@ app.post("/api/community/requests", async (req, res) => {
       [name, whatsapp, referenceUrl || "", referenceProductId, desiredItem || "", suggestedGroupKey, notes]
     );
     const requestRow = rows[0];
-    console.log(`[community] nova solicitação #${requestRow.id}: ${desiredItem || "[somente link]"} -> ${suggestedGroupKey}`);
+    console.log(`[community] nova solicitação #${requestRow.id}: [link] ${instantSearchTerm || referenceProductId || "produto"} -> ${suggestedGroupKey}`);
 
     let lookup = null;
     let instant = { status: "erro_consulta", sent: 0, error: null };
@@ -416,7 +415,7 @@ app.post("/api/community/requests", async (req, res) => {
         lookup = await runManualLookup({ term: instantSearchTerm });
       }
 
-      const delivery = await sendLookupToCustomer({ whatsapp, name, term: instantSearchTerm || desiredItem || "produto solicitado", lookup });
+      const delivery = await sendLookupToCustomer({ whatsapp, name, term: instantSearchTerm || "produto solicitado", lookup });
       instant = { status: delivery.status, sent: delivery.sent, error: null };
       await adminPool.query(
         `UPDATE community_requests SET instant_lookup_count=$2, instant_response_status=$3, instant_response_error=NULL, instant_response_at=NOW(), updated_at=NOW() WHERE id=$1`,
