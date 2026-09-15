@@ -747,7 +747,11 @@ def lookup_term(client: MercadoLivreClient, term: str, limit: int = 3) -> dict:
             break
 
     api_results = [_result(product, search_rank=rank + 1) for rank, product in chosen]
-    if api_results:
+
+    # Se o catálogo já trouxe a quantidade pedida, encerramos aqui.
+    # Se trouxe menos, preservamos esses resultados e usamos os fallbacks
+    # externos apenas para COMPLETAR as vagas restantes.
+    if len(api_results) >= limit:
         return {
             "mode": "term",
             "query": term,
@@ -755,10 +759,10 @@ def lookup_term(client: MercadoLivreClient, term: str, limit: int = 3) -> dict:
             "search_variants": variants,
             "search_attempts": search_attempts,
             "searched_products": len(products),
-            "results": api_results,
+            "results": api_results[:limit],
         }
 
-    # Nada útil no catálogo: usa uma busca externa estruturada para descobrir
+    # Catálogo vazio ou incompleto: usa busca externa estruturada para descobrir
     # anúncios do marketplace sem depender do HTML do Mercado Livre (que pode
     # bloquear datacenters com verificação de conta). Critérios promocionais
     # NÃO bloqueiam a consulta instantânea.
@@ -806,20 +810,46 @@ def lookup_term(client: MercadoLivreClient, term: str, limit: int = 3) -> dict:
         )
         ext_results = [
             _public_result(row, search_rank=rank + 1)
-            for _coverage, _matched, _discount, _price, rank, row in ext_candidates[:limit]
+            for _coverage, _matched, _discount, _price, rank, row in ext_candidates
         ]
+
         if ext_results:
-            return {
-                "mode": "term",
-                "query": term,
-                "source": "serper_marketplace",
-                "search_variants": variants,
-                "search_attempts": search_attempts,
-                "searched_products": len(products),
-                "external_candidates": len(serper_rows),
-                "external_errors": serper_errors,
-                "results": ext_results,
-            }
+            merged_results = []
+            seen_result_keys = set()
+
+            def add_result(row):
+                if not isinstance(row, dict):
+                    return
+                key = (
+                    str(row.get("item_id") or "").strip().upper()
+                    or str(row.get("product_id") or "").strip().upper()
+                    or str(row.get("url") or "").strip()
+                    or f"{row.get('name')}:{row.get('price')}"
+                )
+                if not key or key in seen_result_keys:
+                    return
+                seen_result_keys.add(key)
+                merged_results.append(row)
+
+            for row in api_results:
+                add_result(row)
+            for row in ext_results:
+                add_result(row)
+                if len(merged_results) >= limit:
+                    break
+
+            if merged_results:
+                return {
+                    "mode": "term",
+                    "query": term,
+                    "source": "catalog_api+serper" if api_results else "serper_marketplace",
+                    "search_variants": variants,
+                    "search_attempts": search_attempts,
+                    "searched_products": len(products),
+                    "external_candidates": len(serper_rows),
+                    "external_errors": serper_errors,
+                    "results": merged_results[:limit],
+                }
 
     # Último fallback: tenta o HTML público do marketplace. Em alguns hosts isso
     # pode ser bloqueado por verificação de conta, então ele não é mais o caminho
@@ -871,10 +901,34 @@ def lookup_term(client: MercadoLivreClient, term: str, limit: int = 3) -> dict:
     )
     public_results = [
         _public_result(row, search_rank=rank + 1)
-        for _coverage, _matched, _discount, _price, rank, row in public_candidates[:limit]
+        for _coverage, _matched, _discount, _price, rank, row in public_candidates
     ]
 
-    if not public_results:
+    merged_results = []
+    seen_result_keys = set()
+
+    def add_final_result(row):
+        if not isinstance(row, dict):
+            return
+        key = (
+            str(row.get("item_id") or "").strip().upper()
+            or str(row.get("product_id") or "").strip().upper()
+            or str(row.get("url") or "").strip()
+            or f"{row.get('name')}:{row.get('price')}"
+        )
+        if not key or key in seen_result_keys:
+            return
+        seen_result_keys.add(key)
+        merged_results.append(row)
+
+    for row in api_results:
+        add_final_result(row)
+    for row in public_results:
+        add_final_result(row)
+        if len(merged_results) >= limit:
+            break
+
+    if not merged_results:
         print(
             f"[manual-lookup/termo] '{term}': catálogo={len(products)} PRODUCTs sem oferta utilizável; "
             f"serper={len(serper_rows)} candidato(s); marketplace={len(public_rows)} candidato(s); "
@@ -885,7 +939,15 @@ def lookup_term(client: MercadoLivreClient, term: str, limit: int = 3) -> dict:
     return {
         "mode": "term",
         "query": term,
-        "source": "public_marketplace" if public_results else "none",
+        "source": (
+            "catalog_api+public_marketplace"
+            if api_results and public_results
+            else "catalog_api"
+            if api_results
+            else "public_marketplace"
+            if public_results
+            else "none"
+        ),
         "search_variants": variants,
         "search_attempts": search_attempts,
         "searched_products": len(products),
@@ -893,7 +955,7 @@ def lookup_term(client: MercadoLivreClient, term: str, limit: int = 3) -> dict:
         "external_errors": serper_errors,
         "public_candidates": len(public_rows),
         "public_error": public_error,
-        "results": public_results,
+        "results": merged_results[:limit],
     }
 
 
