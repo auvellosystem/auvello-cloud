@@ -397,18 +397,6 @@ function maskBrazilPhone(value) {
 }
 
 
-const auvelloPhoneInput =
-  document.getElementById('customerPhone') ||
-  document.getElementById('requestPhone') ||
-  document.getElementById('phone');
-
-if (auvelloPhoneInput) {
-  auvelloPhoneInput.addEventListener('input', (e) => {
-    e.target.value = maskBrazilPhone(e.target.value);
-  });
-}
-
-
 app.get("/pedir-oferta", async (_req, res) => {
   let categories = [];
   try { categories = await listCategories({ activeOnly: true, publicOnly: true }); }
