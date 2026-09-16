@@ -12,6 +12,11 @@ from urllib.parse import quote, unquote, urlparse, parse_qs
 import requests
 from dataclasses import asdict
 
+try:
+    from rapidfuzz import fuzz as _fuzz
+except Exception:  # biblioteca ausente/indisponível: cai só no match por palavra
+    _fuzz = None
+
 from app.mercado_livre import MercadoLivreClient
 from app.models import Product
 from app.affiliate import AffiliateClient, AffiliateError
@@ -775,6 +780,41 @@ def _relevance(query: str, name: str) -> tuple[float, int]:
     return matched / len(query_tokens), matched
 
 
+# Aceita um anúncio quando ele bate por palavras (como antes) OU quando o
+# texto como um todo é bem parecido mesmo escrito diferente (ex.: "tapete de
+# borracha fusca" vs "jogo tapete carpete fusca 1959 a 1996") — é a nossa
+# "mini IA" leve e 100% local: comparação estatística de texto (rapidfuzz),
+# sem chamar nenhum serviço externo nem depender de limite de uso.
+_FUZZY_ACCEPT_THRESHOLD = 62
+
+
+def _fuzzy_score(query: str, name: str) -> float:
+    """Similaridade 0-100 entre dois textos, tolerante a ordem de palavras
+    e a trechos parciais. Retorna 0 se a biblioteca não estiver disponível
+    (nesse caso, o sistema cai de volta só no match por palavra-chave)."""
+    if _fuzz is None:
+        return 0.0
+    query = str(query or "").strip()
+    name = str(name or "").strip()
+    if not query or not name:
+        return 0.0
+    # token_set_ratio ignora ordem/repetição de palavras e lida bem com um
+    # texto sendo "subconjunto" do outro (comum: nome curto vs anúncio longo).
+    return float(_fuzz.token_set_ratio(query, name))
+
+
+def _passes_relevance(
+    coverage: float,
+    matched: int,
+    min_coverage: float,
+    min_matches: int,
+    fuzzy_score: float,
+) -> bool:
+    if matched >= min_matches and coverage >= min_coverage:
+        return True
+    return fuzzy_score >= _FUZZY_ACCEPT_THRESHOLD
+
+
 def lookup_term(client: MercadoLivreClient, term: str, limit: int = 3) -> dict:
     # /products/search pode ser bem mais rígido que a busca pública do Mercado
     # Livre. Fazemos poucas tentativas controladas com o mesmo produto descrito
@@ -823,7 +863,7 @@ def lookup_term(client: MercadoLivreClient, term: str, limit: int = 3) -> dict:
             min_matches, min_coverage = 2, 0.40
         else:
             min_matches, min_coverage = 3, 0.30
-        if matched < min_matches or coverage < min_coverage:
+        if not _passes_relevance(coverage, matched, min_coverage, min_matches, _fuzzy_score(term, result_name)):
             continue
 
         offers = client.product_offers(product_id, discounted_only=False)
@@ -833,8 +873,9 @@ def lookup_term(client: MercadoLivreClient, term: str, limit: int = 3) -> dict:
                 offers = [winner_offer]
 
         for offer in _top_unique(offers, 2):
-            effective_coverage, effective_matched = _relevance(term, offer.name or result_name)
-            if effective_matched < min_matches:
+            offer_name = offer.name or result_name
+            effective_coverage, effective_matched = _relevance(term, offer_name)
+            if not _passes_relevance(effective_coverage, effective_matched, min_coverage, min_matches, _fuzzy_score(term, offer_name)):
                 continue
             candidates.append((effective_coverage, effective_matched, rank, offer))
 
@@ -908,8 +949,9 @@ def lookup_term(client: MercadoLivreClient, term: str, limit: int = 3) -> dict:
             ext_min_matches, ext_min_coverage = 3, 0.30
 
         for rank, row in enumerate(serper_rows):
-            coverage, matched = _relevance(term, str(row.get("name") or ""))
-            if matched < ext_min_matches or coverage < ext_min_coverage:
+            row_name = str(row.get("name") or "")
+            coverage, matched = _relevance(term, row_name)
+            if not _passes_relevance(coverage, matched, ext_min_coverage, ext_min_matches, _fuzzy_score(term, row_name)):
                 continue
             price = row.get("price")
             price_sort = float(price) if price is not None else float("inf")
@@ -999,8 +1041,9 @@ def lookup_term(client: MercadoLivreClient, term: str, limit: int = 3) -> dict:
         public_min_matches, public_min_coverage = 3, 0.30
 
     for rank, row in enumerate(public_rows):
-        coverage, matched = _relevance(term, str(row.get("name") or ""))
-        if matched < public_min_matches or coverage < public_min_coverage:
+        row_name = str(row.get("name") or "")
+        coverage, matched = _relevance(term, row_name)
+        if not _passes_relevance(coverage, matched, public_min_coverage, public_min_matches, _fuzzy_score(term, row_name)):
             continue
         price = row.get("price")
         price_sort = float(price) if price is not None else float("inf")
@@ -1362,13 +1405,28 @@ def lookup_reference(client: MercadoLivreClient, reference_url: str, limit: int 
             # PASSO 2 (complemento): quando a página não revela recomendações
             # suficientes (ex.: bloqueio temporário ou markup diferente),
             # completa com busca por termo no catálogo, como antes.
+            # IMPORTANTE: catalog_name vem do endpoint catalog-meta, que pode
+            # tomar 403 no mesmo bloqueio que a raspagem da página — nesse
+            # caso usamos o nome que já veio do próprio item exato (via API
+            # oficial de ofertas), para não deixar a busca por termo vazia.
+            search_term = catalog_name or next(
+                (str(row.get("name") or "").strip() for row in exact_results if row.get("name")),
+                None,
+            )
             similar_results = []
-            if catalog_name and len(page_similar_results) < max(limit * 3, 6):
+            if search_term and len(page_similar_results) < max(limit * 3, 6):
                 try:
-                    similar_payload = lookup_term(client, catalog_name, max(limit * 3, 6))
+                    similar_payload = lookup_term(client, search_term, max(limit * 3, 6))
                     similar_results = list(similar_payload.get("results") or [])
+                    print(
+                        f"[manual-lookup/termo-similar] '{search_term}': {len(similar_results)} resultado(s) (fonte={similar_payload.get('source')})",
+                        file=sys.stderr,
+                    )
                 except Exception as exc:
-                    resolve_errors.append(f"similar_lookup:{catalog_name}: {exc}")
+                    resolve_errors.append(f"similar_lookup:{search_term}: {exc}")
+                    print(f"[manual-lookup/termo-similar] '{search_term}': erro {exc}", file=sys.stderr)
+            elif not search_term:
+                print("[manual-lookup/termo-similar] sem termo disponível para buscar similares", file=sys.stderr)
 
             merged = []
             seen = set()
@@ -1426,7 +1484,7 @@ def lookup_reference(client: MercadoLivreClient, reference_url: str, limit: int 
                 "reference_url": reference_url,
                 "reference_product_id": mlbu,
                 "reference_item_id": item_id,
-                "resolved_term": catalog_name,
+                "resolved_term": search_term,
                 "resolve_errors": resolve_errors,
                 "results": merged[:limit],
             }
