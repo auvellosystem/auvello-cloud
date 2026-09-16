@@ -45,7 +45,11 @@ class Settings:
     min_discount_percent: float = _float("MIN_DISCOUNT_PERCENT", 15)
     big_discount_percent: float = _float("BIG_DISCOUNT_PERCENT", 20)
     min_price_drop_percent: float = _float("MIN_PRICE_DROP_PERCENT", 10)
-    cooldown_hours: int = _int("COOLDOWN_HOURS", 24)
+    cooldown_hours: int = _int("COOLDOWN_HOURS", 24)  # legado
+    specific_product_cooldown_hours: int = _int("SPECIFIC_PRODUCT_COOLDOWN_HOURS", 36)
+    general_product_cooldown_hours: int = _int("GENERAL_PRODUCT_COOLDOWN_HOURS", 72)
+    general_category_cooldown_minutes: int = _int("GENERAL_CATEGORY_COOLDOWN_MINUTES", 60)
+    general_type_cooldown_hours: int = _int("GENERAL_TYPE_COOLDOWN_HOURS", 6)
     # Produtos fixados no Admin: oferta melhor libera imediatamente; oferta
     # igual só pode repetir após este intervalo; oferta pior não repete.
     fixed_product_cooldown_hours: int = _int("FIXED_PRODUCT_COOLDOWN_HOURS", 12)

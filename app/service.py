@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import re
 import time
+import unicodedata
 
 from .affiliate import AffiliateClient, AffiliateError
 from .classifier import Classifier
@@ -163,33 +165,33 @@ class AuvelloService:
         rows = self.db.offer_candidates()
         candidates = [self._candidate_from_record(row) for row in rows]
         available = [c for c in candidates if self.db.can_notify(c.product, GENERAL_GROUP)]
-
-        # O Geral compara todas as categorias no mesmo pool. O score é
-        # recalculado globalmente para que as melhores oportunidades concorram.
         self._assign_scores(available)
-        strong = [
-            c for c in available
-            if self._is_strong_for_general(c, settings.general_routine_min_score)
-        ]
-        strong.sort(
-            key=lambda c: (c.score, c.effective_discount, c.savings),
-            reverse=True,
-        )
-
+        strong = [c for c in available if self._is_strong_for_general(c, settings.general_routine_min_score)]
+        recent_groups = self.db.recent_general_source_groups()
+        recent_types = self.db.recent_general_variety_keys()
+        strong.sort(key=lambda c: (self.db.is_price_drop_exception(c.product, GENERAL_GROUP), c.group not in recent_groups, self._product_type_key(c.product) not in recent_types, c.score, c.effective_discount, c.savings), reverse=True)
         remaining_hour = self._general_remaining_hourly_capacity()
-        selected = strong[: min(settings.max_products_general, remaining_hour)]
-        print(
-            f"[geral] {len(candidates)} candidatos no cache, {len(available)} fora do cooldown, "
-            f"{len(strong)} fortes -> {len(selected)} selecionados | "
-            f"cota hora restante={remaining_hour}"
-        )
-
+        target = min(settings.max_products_general, remaining_hour)
+        selected = []
+        used_groups = set()
+        used_types = set()
+        for candidate in strong:
+            if len(selected) >= target:
+                break
+            type_key = self._product_type_key(candidate.product)
+            price_drop_exception = self.db.is_price_drop_exception(candidate.product, GENERAL_GROUP)
+            if not price_drop_exception:
+                if candidate.group in recent_groups or candidate.group in used_groups:
+                    continue
+                if type_key and (type_key in recent_types or type_key in used_types):
+                    continue
+            selected.append(candidate)
+            used_groups.add(candidate.group)
+            if type_key:
+                used_types.add(type_key)
+        print(f"[geral] {len(candidates)} candidatos no cache, {len(available)} fora do cooldown, {len(strong)} fortes -> {len(selected)} selecionados | categorias recentes={len(recent_groups)} | tipos recentes={len(recent_types)} | cota hora restante={remaining_hour}")
         if remaining_hour <= 0:
-            print(
-                f"[geral] teto de {settings.general_max_messages_per_hour} mensagens/hora atingido; "
-                "rotina sem envio"
-            )
-
+            print(f"[geral] teto de {settings.general_max_messages_per_hour} mensagens/hora atingido; rotina sem envio")
         for candidate in selected:
             if self._message_limit_reached() or self._general_hourly_limit_reached():
                 break
@@ -197,7 +199,6 @@ class AuvelloService:
                 self._publish_general(candidate, reason="rotina")
             except Exception as exc:
                 print(f"[geral] {candidate.product.product_id}: {exc}")
-
         print(f"[fila] {self._messages_sent_this_cycle} mensagens enviadas na rotina Geral")
         print("=== AUVELLO: grupo Geral finalizado ===\n")
 
@@ -300,6 +301,26 @@ class AuvelloService:
         return chosen[: settings.max_products_per_group]
 
     @staticmethod
+    def _product_type_key(product: Product) -> str:
+        text = unicodedata.normalize("NFKD", str(product.name or ""))
+        text = "".join(ch for ch in text if not unicodedata.combining(ch)).lower()
+        tokens = re.findall(r"[a-z0-9]+", text)
+        noise = {"kit", "jogo", "conjunto", "produto", "oferta", "novo", "nova", "original", "para", "com", "sem", "de", "da", "do", "das", "dos", "um", "uma", "unidade", "unidades", "peca", "pecas"}
+        for token in tokens:
+            if token in noise or token.isdigit() or len(token) < 3:
+                continue
+            return token
+        return (product.domain_id or product.category_id or "").lower()
+
+    def _general_diversity_allows(self, candidate: Candidate) -> bool:
+        if self.db.is_price_drop_exception(candidate.product, GENERAL_GROUP):
+            return True
+        if candidate.group in self.db.recent_general_source_groups():
+            return False
+        type_key = self._product_type_key(candidate.product)
+        return not type_key or type_key not in self.db.recent_general_variety_keys()
+
+    @staticmethod
     def _is_strong_for_general(candidate: Candidate, min_score: float) -> bool:
         """Critério premium do Geral: basta cumprir um dos três sinais."""
         return (
@@ -333,7 +354,7 @@ class AuvelloService:
         message = build_message(product, affiliate_url, candidate.previous_price)
 
         if self._queued_send(group, message, product.picture):
-            self.db.mark_notified(product, group)
+            self.db.mark_notified(product, group, source_group_key=group, variety_key=self._product_type_key(product))
             print(
                 f"[enviado] {group}: {product.name} | R$ {(product.price or 0):.2f} | "
                 f"score={candidate.score:.1f}"
@@ -357,8 +378,10 @@ class AuvelloService:
                     f"{product.name}"
                 )
             elif not self._message_limit_reached() and self.db.can_notify(product, GENERAL_GROUP):
-                if self._queued_send(GENERAL_GROUP, message, product.picture):
-                    self.db.mark_notified(product, GENERAL_GROUP)
+                if not self._general_diversity_allows(candidate):
+                    print(f"[espelho] variedade do Geral segurou: {product.name}")
+                elif self._queued_send(GENERAL_GROUP, message, product.picture):
+                    self.db.mark_notified(product, GENERAL_GROUP, source_group_key=group, variety_key=self._product_type_key(product))
                     print(f"[espelho] {group} -> geral: {product.name}")
             else:
                 print(f"[espelho] geral em cooldown: {product.name}")
@@ -372,8 +395,11 @@ class AuvelloService:
         if not affiliate_url:
             return
         message = build_message(product, affiliate_url, candidate.previous_price)
+        if not self._general_diversity_allows(candidate):
+            print(f"[variedade] geral/{reason}: segurado {product.name}")
+            return
         if self._queued_send(GENERAL_GROUP, message, product.picture):
-            self.db.mark_notified(product, GENERAL_GROUP)
+            self.db.mark_notified(product, GENERAL_GROUP, source_group_key=candidate.group, variety_key=self._product_type_key(product))
             print(
                 f"[enviado] geral/{reason}: {product.name} | "
                 f"R$ {(product.price or 0):.2f} | score={candidate.score:.1f}"

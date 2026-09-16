@@ -81,6 +81,9 @@ class Database:
                     group_key TEXT NOT NULL,
                     price DOUBLE PRECISION NOT NULL,
                     discount_percent DOUBLE PRECISION NOT NULL,
+                    source_group_key TEXT,
+                    variety_key TEXT,
+                    product_name TEXT,
                     sent_at TIMESTAMPTZ NOT NULL
                 )
                 """,
@@ -186,6 +189,9 @@ class Database:
                     group_key TEXT NOT NULL,
                     price REAL NOT NULL,
                     discount_percent REAL NOT NULL,
+                    source_group_key TEXT,
+                    variety_key TEXT,
+                    product_name TEXT,
                     sent_at TEXT NOT NULL
                 )
                 """,
@@ -274,6 +280,23 @@ class Database:
         with self._connect() as conn:
             for sql in statements:
                 conn.execute(sql)
+
+            if self.is_postgres:
+                conn.execute("ALTER TABLE product_notifications ADD COLUMN IF NOT EXISTS source_group_key TEXT")
+                conn.execute("ALTER TABLE product_notifications ADD COLUMN IF NOT EXISTS variety_key TEXT")
+                conn.execute("ALTER TABLE product_notifications ADD COLUMN IF NOT EXISTS product_name TEXT")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_product_notifications_general_source ON product_notifications(group_key, source_group_key, sent_at)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_product_notifications_general_variety ON product_notifications(group_key, variety_key, sent_at)")
+            else:
+                columns = {row["name"] for row in conn.execute("PRAGMA table_info(product_notifications)").fetchall()}
+                if "source_group_key" not in columns:
+                    conn.execute("ALTER TABLE product_notifications ADD COLUMN source_group_key TEXT")
+                if "variety_key" not in columns:
+                    conn.execute("ALTER TABLE product_notifications ADD COLUMN variety_key TEXT")
+                if "product_name" not in columns:
+                    conn.execute("ALTER TABLE product_notifications ADD COLUMN product_name TEXT")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_product_notifications_general_source ON product_notifications(group_key, source_group_key, sent_at)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_product_notifications_general_variety ON product_notifications(group_key, variety_key, sent_at)")
 
     @staticmethod
     def price_key(product: Product) -> str:
@@ -400,49 +423,86 @@ class Database:
         min_age = timedelta(hours=max(0, settings.fixed_product_cooldown_hours))
         return datetime.now(timezone.utc) - sent_at >= min_age
 
+    def notification_price_drop_percent(self, product: Product, group_key: str) -> float:
+        last = self.last_notification(product, group_key)
+        if not last:
+            return 0.0
+        last_price = float(last.get("price") or 0.0)
+        current_price = float(product.price or 0.0)
+        if last_price <= 0 or current_price <= 0 or current_price >= last_price:
+            return 0.0
+        return (1.0 - current_price / last_price) * 100.0
+
+    def is_price_drop_exception(self, product: Product, group_key: str) -> bool:
+        return self.notification_price_drop_percent(product, group_key) >= settings.min_price_drop_percent
+
     def can_notify(self, product: Product, group_key: str) -> bool:
-        since = datetime.now(timezone.utc) - timedelta(hours=settings.cooldown_hours)
+        last = self.last_notification(product, group_key)
+        if last is None:
+            return True
+        if self.is_price_drop_exception(product, group_key):
+            return True
+        hours = settings.general_product_cooldown_hours if group_key == "geral" else settings.specific_product_cooldown_hours
+        sent_at = last.get("sent_at")
+        if isinstance(sent_at, str):
+            try:
+                sent_at = datetime.fromisoformat(sent_at.replace("Z", "+00:00"))
+            except ValueError:
+                return False
+        if sent_at is None:
+            return False
+        if sent_at.tzinfo is None:
+            sent_at = sent_at.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) - sent_at >= timedelta(hours=max(0, hours))
+
+    def recent_general_source_groups(self, minutes: int | None = None) -> set[str]:
+        window = max(1, int(minutes if minutes is not None else settings.general_category_cooldown_minutes))
+        since = datetime.now(timezone.utc) - timedelta(minutes=window)
         if not self.is_postgres:
             since = since.isoformat()
-
         p = self._ph
         sql = f"""
-            SELECT 1 FROM product_notifications
-            WHERE catalog_product_key = {p}
-              AND group_key = {p}
+            SELECT DISTINCT source_group_key
+            FROM product_notifications
+            WHERE group_key = {p}
+              AND source_group_key IS NOT NULL
+              AND source_group_key <> ''
               AND sent_at >= {p}
-            LIMIT 1
         """
         with self._connect() as conn:
-            row = conn.execute(
-                sql,
-                (self.notification_key(product), group_key, since),
-            ).fetchone()
-        return row is None
+            rows = conn.execute(sql, ("geral", since)).fetchall()
+        return {str(row["source_group_key"]) for row in rows if row["source_group_key"]}
 
-    def mark_notified(self, product: Product, group_key: str) -> None:
+    def recent_general_variety_keys(self, hours: int | None = None) -> set[str]:
+        window = max(1, int(hours if hours is not None else settings.general_type_cooldown_hours))
+        since = datetime.now(timezone.utc) - timedelta(hours=window)
+        if not self.is_postgres:
+            since = since.isoformat()
+        p = self._ph
+        sql = f"""
+            SELECT DISTINCT variety_key
+            FROM product_notifications
+            WHERE group_key = {p}
+              AND variety_key IS NOT NULL
+              AND variety_key <> ''
+              AND sent_at >= {p}
+        """
+        with self._connect() as conn:
+            rows = conn.execute(sql, ("geral", since)).fetchall()
+        return {str(row["variety_key"]) for row in rows if row["variety_key"]}
+
+    def mark_notified(self, product: Product, group_key: str, *, source_group_key: str | None = None, variety_key: str | None = None) -> None:
         sent_at = datetime.now(timezone.utc)
         if not self.is_postgres:
             sent_at = sent_at.isoformat()
-
         p = self._ph
         sql = f"""
             INSERT INTO product_notifications
-            (catalog_product_key, item_key, group_key, price, discount_percent, sent_at)
-            VALUES ({p}, {p}, {p}, {p}, {p}, {p})
+            (catalog_product_key, item_key, group_key, price, discount_percent, source_group_key, variety_key, product_name, sent_at)
+            VALUES ({p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p})
         """
         with self._connect() as conn:
-            conn.execute(
-                sql,
-                (
-                    self.notification_key(product),
-                    product.item_id,
-                    group_key,
-                    product.price or 0,
-                    product.discount_percent,
-                    sent_at,
-                ),
-            )
+            conn.execute(sql, (self.notification_key(product), product.item_id, group_key, product.price or 0, product.discount_percent, source_group_key, variety_key, product.name, sent_at))
 
     def count_group_notifications_since(self, group_key: str, minutes: int = 60) -> int:
         """Conta envios confirmados a um grupo dentro de uma janela móvel.
