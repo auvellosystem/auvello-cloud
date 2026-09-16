@@ -412,6 +412,83 @@ def _public_marketplace_search(term: str, limit: int = 20) -> tuple[list[dict], 
 
 
 
+_RECOMMENDATION_FRAGMENT_HINTS = (
+    "recommendations_vip-v2p",
+    "reco_backend=",
+    "reco_client=",
+)
+
+
+def _scrape_page_recommendations(
+    page_url: str,
+    *,
+    exclude_mlbu: str | None = None,
+    limit: int = 8,
+) -> tuple[list[str], str | None]:
+    """Extrai os IDs (MLBU...) dos "anúncios semelhantes" que o próprio
+    Mercado Livre já exibe na página do produto compartilhado.
+
+    O Mercado Livre marca cada link do carrossel de recomendações com um
+    fragmento como `#polycard_client=recommendations_vip-v2p&reco_backend=...`.
+    Em vez de tentar reencontrar anúncios parecidos via busca por termo (que
+    pode devolver um conjunto diferente do que a página realmente mostra),
+    lemos o HTML da própria página e extraímos esses IDs diretamente — é
+    exatamente o mesmo conjunto de "outros anúncios" que o usuário vê.
+    """
+    reference_url = str(page_url or "").strip()
+    if not reference_url:
+        return [], "url vazia"
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+        ),
+        "Accept-Language": "pt-BR,pt;q=0.9",
+    }
+    try:
+        response = requests.get(
+            reference_url,
+            headers=headers,
+            timeout=settings.request_timeout,
+            allow_redirects=True,
+        )
+        if response.status_code >= 400:
+            return [], f"HTTP {response.status_code}"
+        text = response.text or ""
+        low_final_url = str(response.url).lower()
+        if "account-verification" in low_final_url or "account-verification" in text[:8000].lower():
+            return [], "verificação de conta"
+    except Exception as exc:
+        return [], str(exc)
+
+    exclude_upper = str(exclude_mlbu or "").strip().upper()
+    found: list[str] = []
+    seen: set[str] = set()
+
+    href_pattern = re.compile(r'href=["\']([^"\']*mercadolivre\.com\.br[^"\']*)["\']', re.I)
+    for match in href_pattern.finditer(text):
+        href = html_lib.unescape(match.group(1))
+        low_href = href.lower()
+        if not any(hint in low_href for hint in _RECOMMENDATION_FRAGMENT_HINTS):
+            continue
+        decoded = unquote(href)
+        id_match = re.search(r"\b(MLBU\d{5,})\b", decoded, re.I)
+        if not id_match:
+            continue
+        candidate = id_match.group(1).upper()
+        if candidate == exclude_upper or candidate in seen:
+            continue
+        seen.add(candidate)
+        found.append(candidate)
+        if len(found) >= limit:
+            break
+
+    if not found:
+        return [], "nenhum anúncio semelhante encontrado no HTML da página"
+    return found, None
+
+
 def _parse_brl_price(value) -> float | None:
     if value is None:
         return None
@@ -1187,8 +1264,39 @@ def lookup_reference(client: MercadoLivreClient, reference_url: str, limit: int 
                 direct.get("results") or [],
             )
 
+            # PASSO 1 (prioritário): os "anúncios semelhantes" que o próprio
+            # Mercado Livre já exibe na página do produto compartilhado.
+            # Raspamos o HTML da própria reference_url em busca desses links
+            # (identificados pelo fragmento `recommendations_vip-v2p`/
+            # `reco_backend=`) e resolvemos cada um pela API oficial, para
+            # trazer exatamente os mesmos anúncios que o usuário já viu na
+            # página, em vez de depender só de busca por termo.
+            page_similar_results: list[dict] = []
+            page_recommendation_ids, page_reco_error = _scrape_page_recommendations(
+                reference_url,
+                exclude_mlbu=mlbu,
+                limit=max(limit * 4, 8),
+            )
+            if page_reco_error:
+                resolve_errors.append(f"page_recommendations: {page_reco_error}")
+            for rec_mlbu in page_recommendation_ids:
+                try:
+                    rec_payload = lookup_product(client, rec_mlbu, 1)
+                except Exception as exc:
+                    resolve_errors.append(f"page_recommendation_product:{rec_mlbu}: {exc}")
+                    continue
+                rec_results = rec_payload.get("results") or []
+                if rec_results:
+                    rec_results, _ = _enrich_catalog_results(client, rec_mlbu, rec_results)
+                    page_similar_results.extend(rec_results)
+                if len(page_similar_results) >= max(limit * 3, 6):
+                    break
+
+            # PASSO 2 (complemento): quando a página não revela recomendações
+            # suficientes (ex.: bloqueio temporário ou markup diferente),
+            # completa com busca por termo no catálogo, como antes.
             similar_results = []
-            if catalog_name:
+            if catalog_name and len(page_similar_results) < max(limit * 3, 6):
                 try:
                     similar_payload = lookup_term(client, catalog_name, max(limit * 3, 6))
                     similar_results = list(similar_payload.get("results") or [])
@@ -1216,7 +1324,11 @@ def lookup_reference(client: MercadoLivreClient, reference_url: str, limit: int 
             for row in exact_results:
                 add_candidate(row)
 
-            # Depois acrescenta alternativas relevantes.
+            # Depois acrescenta os anúncios semelhantes reais da página...
+            for row in page_similar_results:
+                add_candidate(row)
+
+            # ...e usa a busca por termo apenas para completar vagas restantes.
             for row in similar_results:
                 add_candidate(row)
 
@@ -1234,9 +1346,16 @@ def lookup_reference(client: MercadoLivreClient, reference_url: str, limit: int 
                 )
                 merged = head + tail
 
+            similar_source = (
+                "page_recommendations"
+                if page_similar_results
+                else "term_search"
+                if similar_results
+                else "none"
+            )
             return {
                 "mode": "reference",
-                "source": "product_direct+similar",
+                "source": f"product_direct+{similar_source}",
                 "reference_url": reference_url,
                 "reference_product_id": mlbu,
                 "reference_item_id": item_id,
