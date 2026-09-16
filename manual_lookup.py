@@ -424,15 +424,15 @@ def _scrape_page_recommendations(
     *,
     exclude_mlbu: str | None = None,
     limit: int = 8,
-) -> tuple[list[str], str | None]:
-    """Extrai os IDs (MLBU...) dos "anúncios semelhantes" que o próprio
-    Mercado Livre já exibe na página do produto compartilhado.
+) -> tuple[list[dict], str | None]:
+    """Extrai os "anúncios semelhantes" que o próprio Mercado Livre já exibe
+    na página do produto compartilhado (título, preço e ID quando disponíveis).
 
     O Mercado Livre marca cada link do carrossel de recomendações com um
     fragmento como `#polycard_client=recommendations_vip-v2p&reco_backend=...`.
     Em vez de tentar reencontrar anúncios parecidos via busca por termo (que
     pode devolver um conjunto diferente do que a página realmente mostra),
-    lemos o HTML da própria página e extraímos esses IDs diretamente — é
+    lemos o HTML da própria página e extraímos esses cards diretamente — é
     exatamente o mesmo conjunto de "outros anúncios" que o usuário vê.
     """
     reference_url = str(page_url or "").strip()
@@ -463,15 +463,23 @@ def _scrape_page_recommendations(
         return [], str(exc)
 
     exclude_upper = str(exclude_mlbu or "").strip().upper()
-    found: list[str] = []
+    rows: list[dict] = []
     seen: set[str] = set()
 
-    href_pattern = re.compile(r'href=["\']([^"\']*mercadolivre\.com\.br[^"\']*)["\']', re.I)
-    for match in href_pattern.finditer(text):
-        href = html_lib.unescape(match.group(1))
-        low_href = href.lower()
+    # Captura a tag <a> inteira (não só o href) para conseguir extrair título,
+    # preço e imagem do mesmo bloco, como fallback para quando a API oficial
+    # não devolver oferta para o item recomendado (comum quando o anúncio é
+    # de outro vendedor, fora do catálogo consultável do app).
+    anchor_pattern = re.compile(
+        r'<a[^>]+href=["\']([^"\']*mercadolivre\.com\.br[^"\']*)["\'][^>]*>(.*?)</a>',
+        re.I | re.S,
+    )
+    for match in anchor_pattern.finditer(text):
+        href_raw, inner_html = match.group(1), match.group(2)
+        low_href = href_raw.lower()
         if not any(hint in low_href for hint in _RECOMMENDATION_FRAGMENT_HINTS):
             continue
+        href = html_lib.unescape(href_raw)
         decoded = unquote(href)
         id_match = re.search(r"\b(MLBU\d{5,})\b", decoded, re.I)
         if not id_match:
@@ -480,13 +488,41 @@ def _scrape_page_recommendations(
         if candidate == exclude_upper or candidate in seen:
             continue
         seen.add(candidate)
-        found.append(candidate)
-        if len(found) >= limit:
+
+        title = html_lib.unescape(re.sub(r"<[^>]+>", " ", inner_html))
+        title = re.sub(r"\s+", " ", title).strip()
+
+        block = text[match.start(): min(len(text), match.start() + 3000)]
+        fractions = re.findall(r'andes-money-amount__fraction[^>]*>\s*([0-9][0-9\.]*)\s*<', block, re.I)
+        cents = re.search(r'andes-money-amount__cents[^>]*>\s*([0-9]{1,2})\s*<', block, re.I)
+
+        def amount(raw):
+            if not raw:
+                return None
+            try:
+                base = float(raw.replace(".", ""))
+                return base + (float(cents.group(1)) / 100 if cents else 0)
+            except Exception:
+                return None
+
+        price = amount(fractions[0]) if fractions else None
+        original_price = amount(fractions[1]) if len(fractions) > 1 else None
+        image_match = re.search(r'<img[^>]+(?:data-src|src)=["\']([^"\']+)["\']', block, re.I)
+
+        rows.append({
+            "mlbu": candidate,
+            "name": title or None,
+            "price": price,
+            "original_price": original_price,
+            "picture": html_lib.unescape(image_match.group(1)) if image_match else None,
+            "origin_url": href.split("#")[0],
+        })
+        if len(rows) >= limit:
             break
 
-    if not found:
+    if not rows:
         return [], "nenhum anúncio semelhante encontrado no HTML da página"
-    return found, None
+    return rows, None
 
 
 def _parse_brl_price(value) -> float | None:
@@ -1272,23 +1308,54 @@ def lookup_reference(client: MercadoLivreClient, reference_url: str, limit: int 
             # trazer exatamente os mesmos anúncios que o usuário já viu na
             # página, em vez de depender só de busca por termo.
             page_similar_results: list[dict] = []
-            page_recommendation_ids, page_reco_error = _scrape_page_recommendations(
+            page_recommendations, page_reco_error = _scrape_page_recommendations(
                 reference_url,
                 exclude_mlbu=mlbu,
                 limit=max(limit * 4, 8),
             )
             if page_reco_error:
                 resolve_errors.append(f"page_recommendations: {page_reco_error}")
-            for rec_mlbu in page_recommendation_ids:
+                print(f"[manual-lookup/recomendacoes] {mlbu}: {page_reco_error}", file=sys.stderr)
+            else:
+                print(
+                    f"[manual-lookup/recomendacoes] {mlbu}: {len(page_recommendations)} candidato(s) na página",
+                    file=sys.stderr,
+                )
+
+            for rec in page_recommendations:
+                rec_mlbu = rec.get("mlbu")
+                if not rec_mlbu:
+                    continue
+                rec_results: list[dict] = []
                 try:
                     rec_payload = lookup_product(client, rec_mlbu, 1)
+                    rec_results = list(rec_payload.get("results") or [])
                 except Exception as exc:
                     resolve_errors.append(f"page_recommendation_product:{rec_mlbu}: {exc}")
-                    continue
-                rec_results = rec_payload.get("results") or []
+                    print(f"[manual-lookup/recomendacoes] {rec_mlbu}: erro na API oficial: {exc}", file=sys.stderr)
+
                 if rec_results:
-                    rec_results, _ = _enrich_catalog_results(client, rec_mlbu, rec_results)
-                    page_similar_results.extend(rec_results)
+                    enriched, _ = _enrich_catalog_results(client, rec_mlbu, rec_results)
+                    page_similar_results.extend(enriched)
+                else:
+                    # A API oficial não devolveu oferta para esse recomendado
+                    # (comum quando é anúncio de outro vendedor). Em vez de
+                    # descartar, usa os dados já raspados da própria página.
+                    fallback_row = _public_result({
+                        "name": rec.get("name") or rec_mlbu,
+                        "price": rec.get("price"),
+                        "original_price": rec.get("original_price"),
+                        "discount_percent": 0.0,
+                        "currency_id": "BRL",
+                        "origin_url": rec.get("origin_url") or f"https://www.mercadolivre.com.br/up/{rec_mlbu}",
+                        "picture": rec.get("picture"),
+                    })
+                    if fallback_row.get("url"):
+                        page_similar_results.append(fallback_row)
+                        print(f"[manual-lookup/recomendacoes] {rec_mlbu}: sem oferta na API, usando dados raspados da página", file=sys.stderr)
+                    else:
+                        print(f"[manual-lookup/recomendacoes] {rec_mlbu}: sem oferta na API e sem link de afiliado — descartado", file=sys.stderr)
+
                 if len(page_similar_results) >= max(limit * 3, 6):
                     break
 
