@@ -1,4 +1,5 @@
 import express from "express";
+import { timingSafeEqual } from "node:crypto";
 import qrcodeTerminal from "qrcode-terminal";
 import QRCode from "qrcode";
 import pino from "pino";
@@ -195,6 +196,48 @@ app.post("/send", async (req, res) => {
     return res.status(500).json({
       error: String(error),
     });
+  }
+});
+
+function directSendAuthorized(req) {
+  const configured = process.env.WHATSAPP_API_SECRET?.trim() || "";
+  const supplied = String(req.get("x-auvello-key") || "").trim();
+  if (!configured || !supplied) return false;
+  const expectedBuffer = Buffer.from(configured);
+  const suppliedBuffer = Buffer.from(supplied);
+  return expectedBuffer.length === suppliedBuffer.length
+    && timingSafeEqual(expectedBuffer, suppliedBuffer);
+}
+
+app.post("/send/direct", async (req, res) => {
+  if (!directSendAuthorized(req)) {
+    return res.status(401).json({ error: "Nao autorizado." });
+  }
+  if (!ready || !sock) {
+    return res.status(503).json({ error: "WhatsApp ainda nao conectado." });
+  }
+
+  const rawPhone = String(req.body?.phone || "").replace(/\D/g, "");
+  const phone = rawPhone.startsWith("55") ? rawPhone : `55${rawPhone}`;
+  const message = String(req.body?.message || "").trim().slice(0, 4000);
+
+  if (!/^55\d{10,11}$/.test(phone) || !message) {
+    return res.status(400).json({ error: "Informe phone com DDD e message." });
+  }
+
+  try {
+    const requestedJid = `${phone}@s.whatsapp.net`;
+    const matches = await sock.onWhatsApp(requestedJid);
+    const destination = matches?.find((item) => item.exists)?.jid;
+    if (!destination) {
+      return res.status(404).json({ error: "O numero informado nao possui WhatsApp." });
+    }
+
+    const result = await sock.sendMessage(destination, { text: message });
+    return res.json({ ok: true, id: result?.key?.id || null });
+  } catch (error) {
+    console.error("[whatsapp/send/direct]", error);
+    return res.status(500).json({ error: "Nao foi possivel enviar a mensagem." });
   }
 });
 
