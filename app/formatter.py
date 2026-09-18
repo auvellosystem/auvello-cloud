@@ -9,7 +9,8 @@ def brl(value: float | None) -> str:
 
 
 def build_message(product: Product, affiliate_url: str, previous_price: float | None = None) -> str:
-    lines = ["🔥 *ACHADO AUVELLO*", "", f"*{product.name}*", ""]
+    marketplace = "Shopee" if product.marketplace == "shopee" else "Mercado Livre"
+    lines = ["🔥 *ACHADO AUVELLO*", f"🛍️ {marketplace}", "", f"*{product.name}*", ""]
     if product.original_price and product.original_price > (product.price or 0):
         lines.append(f"De: ~{brl(product.original_price)}~")
     lines.append(f"Por: *{brl(product.price)}*")

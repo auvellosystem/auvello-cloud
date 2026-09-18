@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import unicodedata
+
 from .mercado_livre import MercadoLivreClient
 from .models import Product
 
@@ -29,6 +31,38 @@ DOMAIN_HINTS = {
     "CLOTHING": "moda_vestuario",
 }
 
+TITLE_GROUP_HINTS = {
+    "celulares_acessorios": (
+        "smartphone", "celular", "iphone", "galaxy", "motorola", "xiaomi",
+        "capa celular", "carregador celular", "pelicula celular",
+    ),
+    "games_acessorios": (
+        "playstation", "ps5", "ps4", "xbox", "nintendo", "videogame",
+        "video game", "console", "controle gamer", "jogo gamer",
+    ),
+    "pet_shop": (
+        "racao", "pet shop", "cachorro", "gato", "caes", "gatos",
+        "areia sanitaria", "tapete higienico",
+    ),
+    "utilidades_domesticas": (
+        "air fryer", "fritadeira", "aspirador", "liquidificador", "cafeteira",
+        "panela", "microondas", "geladeira", "maquina de lavar", "cozinha",
+    ),
+    "moda_vestuario": (
+        "tenis", "camiseta", "camisa", "calca", "vestido", "sandalia",
+        "sapato", "jaqueta", "moletom", "bolsa feminina",
+    ),
+    "eletronicos_tecnologia": (
+        "notebook", "computador", "monitor", "smart tv", "televisao", "tablet",
+        "fone", "headphone", "impressora", "camera", "ssd", "roteador",
+    ),
+}
+
+
+def _normalize(value: str) -> str:
+    text = unicodedata.normalize("NFKD", value or "")
+    return "".join(ch for ch in text if not unicodedata.combining(ch)).casefold()
+
 
 class Classifier:
     def __init__(self, ml: MercadoLivreClient) -> None:
@@ -36,7 +70,7 @@ class Classifier:
         self._cache: dict[str, str | None] = {}
 
     def classify(self, product: Product) -> str | None:
-        if product.category_id:
+        if product.marketplace == "mercado_livre" and product.category_id:
             if product.category_id in self._cache:
                 return self._cache[product.category_id]
             try:
@@ -55,6 +89,11 @@ class Classifier:
         domain = (product.domain_id or "").upper().split("-", 1)[-1]
         for hint, group in DOMAIN_HINTS.items():
             if hint in domain:
+                return group
+
+        title = _normalize(product.name)
+        for group, hints in TITLE_GROUP_HINTS.items():
+            if any(hint in title for hint in hints):
                 return group
 
         if product.category_id:

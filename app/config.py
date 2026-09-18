@@ -42,6 +42,18 @@ class Settings:
     max_products_per_query: int = _int("MAX_PRODUCTS_PER_QUERY", 5)
     request_timeout: int = _int("REQUEST_TIMEOUT", 20)
 
+    # Shopee Affiliate API. Quando as credenciais não estiverem preenchidas,
+    # a descoberta da Shopee é simplesmente ignorada e o Mercado Livre segue.
+    shopee_enabled: bool = _bool("SHOPEE_ENABLED", True)
+    shopee_app_id: str = os.getenv("SHOPEE_APP_ID", "").strip()
+    shopee_secret: str = os.getenv("SHOPEE_SECRET", "").strip()
+    shopee_api_url: str = os.getenv(
+        "SHOPEE_API_URL",
+        "https://open-api.affiliate.shopee.com.br/graphql",
+    ).strip()
+    shopee_max_terms_per_cycle: int = _int("SHOPEE_MAX_TERMS_PER_CYCLE", 12)
+    shopee_products_per_term: int = _int("SHOPEE_PRODUCTS_PER_TERM", 20)
+
     min_discount_percent: float = _float("MIN_DISCOUNT_PERCENT", 15)
     big_discount_percent: float = _float("BIG_DISCOUNT_PERCENT", 20)
     min_price_drop_percent: float = _float("MIN_PRICE_DROP_PERCENT", 10)

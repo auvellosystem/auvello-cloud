@@ -17,6 +17,9 @@ class Product:
     # prevalece sobre a classificacao automatica. Fontes normais deixam None.
     forced_group: str | None = None
     discovery_source: str | None = None
+    # Mantém as chaves de histórico/cooldown separadas e permite escolher o
+    # gerador de link correto. Os objetos antigos continuam sendo Mercado Livre.
+    marketplace: str = "mercado_livre"
 
     @property
     def discount_percent(self) -> float:

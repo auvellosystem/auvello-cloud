@@ -5,6 +5,7 @@ from pathlib import Path
 from collections import Counter
 
 from .mercado_livre import MercadoLivreClient
+from .shopee import ShopeeClient
 from .models import Product
 from .config import settings
 from .database import Database
@@ -41,6 +42,15 @@ AUVELLO_ROOTS = {
     "pet_shop": ["MLB1071"],
 }
 
+SHOPEE_DEFAULT_TERMS = {
+    "eletronicos_tecnologia": ["notebook", "smart tv"],
+    "moda_vestuario": ["tênis", "roupa masculina"],
+    "celulares_acessorios": ["smartphone", "fone bluetooth"],
+    "games_acessorios": ["console videogame", "controle gamer"],
+    "utilidades_domesticas": ["air fryer", "aspirador robô"],
+    "pet_shop": ["ração cachorro", "ração gato"],
+}
+
 
 class Discovery:
     """
@@ -53,9 +63,16 @@ class Discovery:
     Não depende de pai/filho.
     """
 
-    def __init__(self, ml: MercadoLivreClient, db: Database | None = None) -> None:
+    def __init__(
+        self,
+        ml: MercadoLivreClient,
+        db: Database | None = None,
+        shopee: ShopeeClient | None = None,
+    ) -> None:
         self.ml = ml
         self.db = db
+        self.shopee = shopee
+        self._shopee_term_cursor = 0
 
     def run(self) -> list[Product]:
         offers: dict[str, Product] = {}
@@ -77,6 +94,10 @@ class Discovery:
         # O link enviado pelo membro é só referência; não fixa aquele anúncio.
         self._from_community(offers)
 
+        # A Shopee entra no mesmo cache, regras, score e fila do Mercado Livre.
+        # Uma falha nela não impede o restante da descoberta.
+        self._from_shopee(offers)
+
         # Produtos fixados pelo dev entram por ultimo para que o grupo escolhido
         # no Admin prevaleca se a mesma oferta tambem vier de outra fonte.
         # Continua sendo uma fonte aditiva: nao substitui Highlights/Watchlist/Trends.
@@ -95,7 +116,7 @@ class Discovery:
         if not offer.permalink:
             return False
 
-        out[str(offer.item_id)] = offer
+        out[f"{offer.marketplace}:{offer.item_id}"] = offer
         return True
 
     def _add_many(
@@ -370,6 +391,94 @@ class Discovery:
                 )
             except Exception as exc:
                 print(f"[admin] {product_id}: {exc}")
+
+    def _shopee_search_terms(self) -> list[tuple[str, str | None, str]]:
+        """Monta termos da configuração existente sem exigir painel novo."""
+        entries: list[tuple[str, str | None, str]] = []
+
+        if self.db is not None:
+            try:
+                for row in self.db.active_search_categories():
+                    group = (row.get("group_key") or "").strip() or None
+                    for term in _split_search_terms(row.get("search_term") or ""):
+                        entries.append((term, group, "admin_category"))
+            except Exception as exc:
+                print(f"[shopee] categorias dinâmicas: {exc}")
+
+            try:
+                for row in self.db.approved_community_requests():
+                    term = (row.get("search_term") or "").strip()
+                    group = (row.get("group_key") or "").strip() or None
+                    if term:
+                        entries.append((term, group, "community"))
+            except Exception as exc:
+                print(f"[shopee] pedidos da comunidade: {exc}")
+
+        if settings.discovery_watchlist:
+            path = Path("watchlist.json")
+            if path.exists():
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    for term in data.get("queries", []):
+                        clean = " ".join(str(term).split()).strip()
+                        if clean:
+                            entries.append((clean, None, "watchlist"))
+                except Exception as exc:
+                    print(f"[shopee] watchlist: {exc}")
+
+        for group, terms in SHOPEE_DEFAULT_TERMS.items():
+            for term in terms:
+                entries.append((term, group, "default"))
+
+        unique: list[tuple[str, str | None, str]] = []
+        positions: dict[str, int] = {}
+        for term, group, source in entries:
+            key = term.casefold()
+            if key in positions:
+                # Se o termo repetido mais recente conhece o grupo e o
+                # primeiro não, aproveita a classificação sem repetir a API.
+                index = positions[key]
+                old_term, old_group, old_source = unique[index]
+                if not old_group and group:
+                    unique[index] = (old_term, group, source)
+                continue
+            positions[key] = len(unique)
+            unique.append((term, group, source))
+        return unique
+
+    def _from_shopee(self, out: dict[str, Product]) -> None:
+        if self.shopee is None or not self.shopee.configured:
+            print("[shopee] desativada ou sem SHOPEE_APP_ID/SHOPEE_SECRET")
+            return
+
+        terms = self._shopee_search_terms()
+        if not terms:
+            print("[shopee] nenhum termo de busca configurado")
+            return
+
+        limit = max(1, min(settings.shopee_max_terms_per_cycle, len(terms)))
+        start = self._shopee_term_cursor % len(terms)
+        selected = [terms[(start + offset) % len(terms)] for offset in range(limit)]
+        self._shopee_term_cursor = (start + limit) % len(terms)
+
+        total = 0
+        for term, forced_group, source in selected:
+            try:
+                offers = self.shopee.search_offers(term)
+                for offer in offers:
+                    if forced_group:
+                        offer.forced_group = forced_group
+                    offer.discovery_source = f"shopee_{source}"
+                added = self._add_many(out, offers)
+                total += added
+                print(
+                    f"[shopee] {term!r} -> {forced_group or 'classificação automática'}: "
+                    f"{len(offers)} recebidas, {added} adicionadas"
+                )
+            except Exception as exc:
+                print(f"[shopee] {term!r}: {exc}")
+
+        print(f"[shopee] {len(selected)}/{len(terms)} termos processados, {total} ofertas adicionadas")
 
     def _from_trends(self, out: dict[str, Product]) -> None:
         """

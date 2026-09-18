@@ -14,6 +14,7 @@ from .discovery import Discovery
 from .formatter import build_message
 from .mercado_livre import MercadoLivreClient
 from .models import Product
+from .shopee import ShopeeClient
 from .whatsapp import WhatsAppClient
 
 
@@ -47,8 +48,9 @@ class Candidate:
 class AuvelloService:
     def __init__(self) -> None:
         self.ml = MercadoLivreClient()
+        self.shopee = ShopeeClient()
         self.db = Database()
-        self.discovery = Discovery(self.ml, self.db)
+        self.discovery = Discovery(self.ml, self.db, self.shopee)
         self.classifier = Classifier(self.ml)
         self.affiliate = AffiliateClient()
         self.whatsapp = WhatsAppClient()
@@ -138,6 +140,12 @@ class AuvelloService:
             self._assign_scores(pool)
             available = [c for c in pool if self.db.can_notify(c.product, group)]
             group_selected = self._select_opportunity_slots(available)
+            group_selected = self._ensure_marketplace_slot(
+                selected=group_selected,
+                pool=available,
+                marketplace="shopee",
+                limit=settings.max_products_per_group,
+            )
             selected.extend(group_selected)
             print(
                 f"[slots] {group}: {len(pool)} no cache, {len(available)} fora do cooldown -> "
@@ -169,7 +177,9 @@ class AuvelloService:
         strong = [c for c in available if self._is_strong_for_general(c, settings.general_routine_min_score)]
         recent_groups = self.db.recent_general_source_groups()
         recent_types = self.db.recent_general_variety_keys()
-        strong.sort(key=lambda c: (self.db.is_price_drop_exception(c.product, GENERAL_GROUP), c.group not in recent_groups, self._product_type_key(c.product) not in recent_types, c.score, c.effective_discount, c.savings), reverse=True)
+        # Havendo uma oferta elegível da Shopee, ela recebe prioridade para
+        # garantir presença no lote do Geral sem furar cooldown/diversidade.
+        strong.sort(key=lambda c: (c.product.marketplace == "shopee", self.db.is_price_drop_exception(c.product, GENERAL_GROUP), c.group not in recent_groups, self._product_type_key(c.product) not in recent_types, c.score, c.effective_discount, c.savings), reverse=True)
         remaining_hour = self._general_remaining_hourly_capacity()
         target = min(settings.max_products_general, remaining_hour)
         selected = []
@@ -301,6 +311,55 @@ class AuvelloService:
         return chosen[: settings.max_products_per_group]
 
     @staticmethod
+    def _ensure_marketplace_slot(
+        selected: list[Candidate],
+        pool: list[Candidate],
+        marketplace: str,
+        limit: int,
+    ) -> list[Candidate]:
+        """Reserva uma vaga para uma loja, mas só entre ofertas elegíveis.
+
+        O pool já passou por desconto, cooldown e classificação. Portanto a
+        reserva não força produto ruim; apenas evita que o score deixe a loja
+        inteira fora do lote.
+        """
+        result = list(selected)
+        if any(c.product.marketplace == marketplace for c in result):
+            return result[:limit]
+
+        candidates = [
+            c for c in pool
+            if c.product.marketplace == marketplace and c not in result
+        ]
+        if not candidates or limit <= 0:
+            return result[:limit]
+
+        best = max(
+            candidates,
+            key=lambda c: (c.score, c.effective_discount, c.savings),
+        )
+        if len(result) < limit:
+            result.append(best)
+            return result
+
+        replaceable = [
+            (index, candidate)
+            for index, candidate in enumerate(result)
+            if candidate.product.marketplace != marketplace
+        ]
+        if replaceable:
+            index, _ = min(
+                replaceable,
+                key=lambda pair: (
+                    pair[1].score,
+                    pair[1].effective_discount,
+                    pair[1].savings,
+                ),
+            )
+            result[index] = best
+        return result[:limit]
+
+    @staticmethod
     def _product_type_key(product: Product) -> str:
         text = unicodedata.normalize("NFKD", str(product.name or ""))
         text = "".join(ch for ch in text if not unicodedata.combining(ch)).lower()
@@ -406,6 +465,10 @@ class AuvelloService:
             )
 
     def _affiliate_url(self, product: Product) -> str | None:
+        # O offerLink retornado pela API da Shopee já contém o rastreamento do
+        # afiliado. Passá-lo pelo gerador do Mercado Livre destruiria o link.
+        if product.marketplace == "shopee":
+            return product.permalink or None
         try:
             return self.affiliate.build(product.permalink)
         except AffiliateError as exc:
@@ -455,6 +518,7 @@ class AuvelloService:
             "picture": p.picture,
             "forced_group": p.forced_group,
             "discovery_source": p.discovery_source,
+            "marketplace": p.marketplace,
             "group_key": candidate.group,
             "previous_price": candidate.previous_price,
             "drop_percent": candidate.drop_percent,
@@ -476,6 +540,7 @@ class AuvelloService:
             picture=row.get("picture"),
             forced_group=row.get("forced_group"),
             discovery_source=row.get("discovery_source"),
+            marketplace=row.get("marketplace") or "mercado_livre",
         )
         return Candidate(
             product=product,

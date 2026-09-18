@@ -141,6 +141,7 @@ class Database:
                     picture TEXT,
                     forced_group TEXT,
                     discovery_source TEXT,
+                    marketplace TEXT NOT NULL DEFAULT 'mercado_livre',
                     group_key TEXT NOT NULL,
                     previous_price DOUBLE PRECISION,
                     drop_percent DOUBLE PRECISION NOT NULL DEFAULT 0,
@@ -249,6 +250,7 @@ class Database:
                     picture TEXT,
                     forced_group TEXT,
                     discovery_source TEXT,
+                    marketplace TEXT NOT NULL DEFAULT 'mercado_livre',
                     group_key TEXT NOT NULL,
                     previous_price REAL,
                     drop_percent REAL NOT NULL DEFAULT 0,
@@ -285,6 +287,7 @@ class Database:
                 conn.execute("ALTER TABLE product_notifications ADD COLUMN IF NOT EXISTS source_group_key TEXT")
                 conn.execute("ALTER TABLE product_notifications ADD COLUMN IF NOT EXISTS variety_key TEXT")
                 conn.execute("ALTER TABLE product_notifications ADD COLUMN IF NOT EXISTS product_name TEXT")
+                conn.execute("ALTER TABLE offer_candidates ADD COLUMN IF NOT EXISTS marketplace TEXT NOT NULL DEFAULT 'mercado_livre'")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_product_notifications_general_source ON product_notifications(group_key, source_group_key, sent_at)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_product_notifications_general_variety ON product_notifications(group_key, variety_key, sent_at)")
             else:
@@ -295,6 +298,9 @@ class Database:
                     conn.execute("ALTER TABLE product_notifications ADD COLUMN variety_key TEXT")
                 if "product_name" not in columns:
                     conn.execute("ALTER TABLE product_notifications ADD COLUMN product_name TEXT")
+                offer_columns = {row["name"] for row in conn.execute("PRAGMA table_info(offer_candidates)").fetchall()}
+                if "marketplace" not in offer_columns:
+                    conn.execute("ALTER TABLE offer_candidates ADD COLUMN marketplace TEXT NOT NULL DEFAULT 'mercado_livre'")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_product_notifications_general_source ON product_notifications(group_key, source_group_key, sent_at)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_product_notifications_general_variety ON product_notifications(group_key, variety_key, sent_at)")
 
@@ -615,11 +621,11 @@ class Database:
             INSERT INTO offer_candidates (
                 catalog_product_key, product_id, item_id, name, category_id,
                 domain_id, price, original_price, currency_id, permalink,
-                picture, forced_group, discovery_source, group_key,
+                picture, forced_group, discovery_source, marketplace, group_key,
                 previous_price, drop_percent, score, updated_at
             ) VALUES (
                 {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p},
-                {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}
+                {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}
             )
             ON CONFLICT(catalog_product_key) DO UPDATE SET
                 product_id = excluded.product_id,
@@ -634,6 +640,7 @@ class Database:
                 picture = excluded.picture,
                 forced_group = excluded.forced_group,
                 discovery_source = excluded.discovery_source,
+                marketplace = excluded.marketplace,
                 group_key = excluded.group_key,
                 previous_price = excluded.previous_price,
                 drop_percent = excluded.drop_percent,
@@ -647,7 +654,8 @@ class Database:
                     c["name"], c.get("category_id"), c.get("domain_id"), c["price"],
                     c.get("original_price"), c.get("currency_id") or "BRL",
                     c["permalink"], c.get("picture"), c.get("forced_group"),
-                    c.get("discovery_source"), c["group_key"], c.get("previous_price"),
+                    c.get("discovery_source"), c.get("marketplace") or "mercado_livre",
+                    c["group_key"], c.get("previous_price"),
                     c.get("drop_percent", 0.0), c.get("score", 0.0), stored_now,
                 ))
         return len(candidates)
@@ -720,4 +728,3 @@ class Database:
             }
             for row in rows
         ]
-

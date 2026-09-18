@@ -1,0 +1,47 @@
+INTEGRAÇÃO DA SHOPEE NO AUVELLO CLOUD
+=====================================
+
+1. Copie os arquivos deste patch para a raiz do projeto, mantendo as pastas.
+   Quando o Windows perguntar, confirme a substituição.
+
+2. No Render, abra o serviço auvello-cloud e entre em Environment.
+   Adicione estas variáveis (sem aspas):
+
+   SHOPEE_ENABLED=true
+   SHOPEE_APP_ID=seu_app_id_da_shopee
+   SHOPEE_SECRET=seu_secret_da_shopee
+   SHOPEE_API_URL=https://open-api.affiliate.shopee.com.br/graphql
+   SHOPEE_MAX_TERMS_PER_CYCLE=12
+   SHOPEE_PRODUCTS_PER_TERM=20
+
+3. Não altere DATABASE_URL, as variáveis do Mercado Livre nem as do WhatsApp.
+
+4. Teste localmente:
+
+   python -m compileall app
+   python test_shopee.py
+
+   O teste real da API precisa que SHOPEE_APP_ID e SHOPEE_SECRET estejam no
+   .env local. Ele não envia mensagens para o WhatsApp.
+
+5. Envie ao GitHub:
+
+   git add app .env.example LEIA-ME-SHOPEE.txt test_shopee.py
+   git commit -m "Integra ofertas da Shopee ao Auvello Cloud"
+   git push
+
+6. O Render fará o deploy automaticamente. No log, procure linhas iniciadas
+   por [shopee]. Se as credenciais não estiverem configuradas, o sistema apenas
+   ignora a Shopee e continua funcionando com o Mercado Livre.
+
+COMO FUNCIONA
+-------------
+
+- Consulta termos do Admin, pedidos aprovados, watchlist.json e termos padrão.
+- Alterna os termos entre ciclos para limitar chamadas à API.
+- Usa o offerLink fornecido pela Shopee, que já é o link de afiliado.
+- Aplica as mesmas regras de desconto, score, cooldown, grupos e fila WhatsApp.
+- Reserva ao menos uma vaga para a Shopee em cada lote quando existir uma
+  oferta elegível dela; sem oferta elegível, o Mercado Livre segue normalmente.
+- Salva marketplace no cache do Neon. A coluna é criada automaticamente.
+- A mensagem identifica se a oferta veio da Shopee ou do Mercado Livre.
