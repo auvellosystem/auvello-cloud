@@ -191,3 +191,7 @@ Se o desconto anunciado for >= 20%, também vai para `Auvello - Maiores Desconto
 - `app/whatsapp.py` → chamada ao serviço local
 - `app/formatter.py` → mensagem do grupo
 - `whatsapp-service/index.js` → envio aos grupos
+
+## Novo: vídeos para TikTok
+
+Consulte `LEIA-ME-VIDEOS.md`. Geração de vídeos e legendas, entrega ao WhatsApp pessoal e publicação manual no TikTok. A fila fica no banco já configurado.

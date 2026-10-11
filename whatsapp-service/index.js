@@ -1,4 +1,6 @@
 import express from "express";
+import pg from "pg";
+import { createVideoHandler, DEFAULT_VIDEO_PHONE } from "./video-delivery.js";
 import { timingSafeEqual } from "node:crypto";
 import qrcodeTerminal from "qrcode-terminal";
 import QRCode from "qrcode";
@@ -11,6 +13,11 @@ import { Boom } from "@hapi/boom";
 import { useNeonAuthState } from "./neon-auth.js";
 
 const app = express();
+// Authenticate before parsing the potentially large video payload.
+app.use('/send/video-asset', (req, res, next) => {
+  if (!directSendAuthorized(req)) return res.status(401).json({ error: 'Nao autorizado.' });
+  next();
+}, express.json({ limit: '22mb' }));
 app.use(express.json({ limit: "1mb" }));
 
 let sock = null;
@@ -240,6 +247,16 @@ app.post("/send/direct", async (req, res) => {
     return res.status(500).json({ error: "Nao foi possivel enviar a mensagem." });
   }
 });
+
+const videoPool = process.env.DATABASE_URL?.trim()
+  ? new pg.Pool({ connectionString: process.env.DATABASE_URL.trim(), max: 2,
+                  connectionTimeoutMillis: 15000, idleTimeoutMillis: 30000 }) : null;
+app.post('/send/video-asset', createVideoHandler({
+  authorized: directSendAuthorized,
+  getSocket: () => ready ? sock : null,
+  pool: videoPool,
+  recipient: process.env.VIDEOS_WHATSAPP_PHONE?.trim() || DEFAULT_VIDEO_PHONE,
+}));
 
 const PORT = process.env.PORT || 3000;
 

@@ -10,6 +10,8 @@ RUN apt-get update \
         python3-pip \
         ca-certificates \
         git \
+        ffmpeg \
+        fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

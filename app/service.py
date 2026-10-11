@@ -16,6 +16,7 @@ from .mercado_livre import MercadoLivreClient
 from .models import Product
 from .shopee import ShopeeClient
 from .whatsapp import WhatsAppClient
+from .videos import VideoGenerator
 
 
 GENERAL_GROUP = "geral"
@@ -54,6 +55,7 @@ class AuvelloService:
         self.classifier = Classifier(self.ml)
         self.affiliate = AffiliateClient()
         self.whatsapp = WhatsAppClient()
+        self.videos = VideoGenerator()
         self._last_send_at: float | None = None
         self._messages_sent_this_cycle = 0
 
@@ -121,7 +123,19 @@ class AuvelloService:
             print(f"[controle] {without_group} ofertas sem grupo")
         if not_qualified:
             print(f"[controle] {not_qualified} ofertas sem alerta")
+        self.run_videos()
         print("=== AUVELLO: descoberta finalizada ===\n")
+
+    def run_videos(self) -> None:
+        if not self.videos.enabled:
+            return
+        try:
+            from .video_jobs import VideoDelivery
+            candidates = [self._candidate_from_record(row) for row in self.db.offer_candidates()]
+            candidates.sort(key=lambda c: c.score, reverse=True)
+            VideoDelivery(self.db, self.whatsapp, self._affiliate_url).run(candidates)
+        except Exception as exc:
+            print(f"[videos] Ciclo adiado ({type(exc).__name__}); WhatsApp dos grupos continua.")
 
     def run_specific_groups(self) -> None:
         print("\n=== AUVELLO: grupos especificos ===")
