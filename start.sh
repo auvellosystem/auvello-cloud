@@ -5,13 +5,6 @@ PORT="${PORT:-3000}"
 export PORT
 export WHATSAPP_SERVICE_URL="${WHATSAPP_SERVICE_URL:-http://127.0.0.1:${PORT}}"
 
-# Shared internal API key generated locally; existing configured keys remain valid.
-if [[ -z "${WHATSAPP_API_SECRET:-}" ]]; then
-  WHATSAPP_API_SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
-  export WHATSAPP_API_SECRET
-fi
-export VIDEOS_WHATSAPP_PHONE="${VIDEOS_WHATSAPP_PHONE:-5528999676818}"
-
 NODE_PID=""
 PY_PID=""
 

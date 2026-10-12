@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import time
-import base64
-import os
 import requests
 
 from .config import settings
@@ -55,25 +53,3 @@ class WhatsAppClient:
             print(f"[whatsapp] erro {response.status_code}: {text[:300]}")
             return False
         return False
-
-    def send_video_asset(self, job, phase):
-        secret = os.getenv("WHATSAPP_API_SECRET", "").strip()
-        if not secret:
-            print("[videos] WHATSAPP_API_SECRET ausente; envio adiado.")
-            return None
-        payload = {"phone": job["recipient"], "jobKey": job["job_key"], "phase": phase}
-        if phase == "video":
-            payload["videoBase64"] = base64.b64encode(bytes(job["video"])).decode("ascii")
-        else:
-            payload["message"] = job["caption"]
-        try:
-            response = requests.post(f"{settings.whatsapp_service_url}/send/video-asset",
-                json=payload, headers={"x-auvello-key": secret}, timeout=(10, 180))
-            if response.ok:
-                result = response.json()
-                if result.get("ok") and result.get("id"):
-                    return result
-            print(f"[videos] Envio adiado: HTTP {response.status_code}.")
-        except requests.RequestException:
-            print("[videos] Serviço indisponível; arquivo preservado no banco para nova tentativa.")
-        return None

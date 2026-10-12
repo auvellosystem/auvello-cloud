@@ -81,9 +81,6 @@ class Database:
                     group_key TEXT NOT NULL,
                     price DOUBLE PRECISION NOT NULL,
                     discount_percent DOUBLE PRECISION NOT NULL,
-                    source_group_key TEXT,
-                    variety_key TEXT,
-                    product_name TEXT,
                     sent_at TIMESTAMPTZ NOT NULL
                 )
                 """,
@@ -141,7 +138,6 @@ class Database:
                     picture TEXT,
                     forced_group TEXT,
                     discovery_source TEXT,
-                    marketplace TEXT NOT NULL DEFAULT 'mercado_livre',
                     group_key TEXT NOT NULL,
                     previous_price DOUBLE PRECISION,
                     drop_percent DOUBLE PRECISION NOT NULL DEFAULT 0,
@@ -190,9 +186,6 @@ class Database:
                     group_key TEXT NOT NULL,
                     price REAL NOT NULL,
                     discount_percent REAL NOT NULL,
-                    source_group_key TEXT,
-                    variety_key TEXT,
-                    product_name TEXT,
                     sent_at TEXT NOT NULL
                 )
                 """,
@@ -250,7 +243,6 @@ class Database:
                     picture TEXT,
                     forced_group TEXT,
                     discovery_source TEXT,
-                    marketplace TEXT NOT NULL DEFAULT 'mercado_livre',
                     group_key TEXT NOT NULL,
                     previous_price REAL,
                     drop_percent REAL NOT NULL DEFAULT 0,
@@ -282,27 +274,6 @@ class Database:
         with self._connect() as conn:
             for sql in statements:
                 conn.execute(sql)
-
-            if self.is_postgres:
-                conn.execute("ALTER TABLE product_notifications ADD COLUMN IF NOT EXISTS source_group_key TEXT")
-                conn.execute("ALTER TABLE product_notifications ADD COLUMN IF NOT EXISTS variety_key TEXT")
-                conn.execute("ALTER TABLE product_notifications ADD COLUMN IF NOT EXISTS product_name TEXT")
-                conn.execute("ALTER TABLE offer_candidates ADD COLUMN IF NOT EXISTS marketplace TEXT NOT NULL DEFAULT 'mercado_livre'")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_product_notifications_general_source ON product_notifications(group_key, source_group_key, sent_at)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_product_notifications_general_variety ON product_notifications(group_key, variety_key, sent_at)")
-            else:
-                columns = {row["name"] for row in conn.execute("PRAGMA table_info(product_notifications)").fetchall()}
-                if "source_group_key" not in columns:
-                    conn.execute("ALTER TABLE product_notifications ADD COLUMN source_group_key TEXT")
-                if "variety_key" not in columns:
-                    conn.execute("ALTER TABLE product_notifications ADD COLUMN variety_key TEXT")
-                if "product_name" not in columns:
-                    conn.execute("ALTER TABLE product_notifications ADD COLUMN product_name TEXT")
-                offer_columns = {row["name"] for row in conn.execute("PRAGMA table_info(offer_candidates)").fetchall()}
-                if "marketplace" not in offer_columns:
-                    conn.execute("ALTER TABLE offer_candidates ADD COLUMN marketplace TEXT NOT NULL DEFAULT 'mercado_livre'")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_product_notifications_general_source ON product_notifications(group_key, source_group_key, sent_at)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_product_notifications_general_variety ON product_notifications(group_key, variety_key, sent_at)")
 
     @staticmethod
     def price_key(product: Product) -> str:
@@ -360,155 +331,49 @@ class Database:
             return None
         return float(rows[1]["price"])
 
-    def last_notification(self, product: Product, group_key: str) -> dict[str, Any] | None:
-        """Última publicação confirmada deste PRODUCT_ID neste grupo."""
+    def can_notify(self, product: Product, group_key: str) -> bool:
+        since = datetime.now(timezone.utc) - timedelta(hours=settings.cooldown_hours)
+        if not self.is_postgres:
+            since = since.isoformat()
+
         p = self._ph
         sql = f"""
-            SELECT price, discount_percent, sent_at
-            FROM product_notifications
+            SELECT 1 FROM product_notifications
             WHERE catalog_product_key = {p}
               AND group_key = {p}
-            ORDER BY sent_at DESC
+              AND sent_at >= {p}
             LIMIT 1
         """
         with self._connect() as conn:
             row = conn.execute(
                 sql,
-                (self.notification_key(product), group_key),
+                (self.notification_key(product), group_key, since),
             ).fetchone()
-        if row is None:
-            return None
-        return dict(row)
+        return row is None
 
-    def can_notify_fixed_product(self, product: Product, group_key: str) -> bool:
-        """Regra especial dos produtos fixados no Admin.
-
-        - Primeira publicação: liberada normalmente.
-        - Oferta melhor que a última publicada: libera imediatamente.
-        - Oferta exatamente igual: pode repetir após o cooldown específico dos fixados.
-        - Oferta pior: não repete.
-
-        Uma oferta é considerada melhor quando o preço atual diminuiu OU o
-        percentual de desconto aumentou em relação à última publicação.
-        """
-        last = self.last_notification(product, group_key)
-        if last is None:
-            return True
-
-        current_price = float(product.price or 0.0)
-        current_discount = float(product.discount_percent or 0.0)
-        last_price = float(last.get("price") or 0.0)
-        last_discount = float(last.get("discount_percent") or 0.0)
-
-        price_better = current_price > 0 and last_price > 0 and current_price < (last_price - 0.009)
-        discount_better = current_discount > (last_discount + 0.009)
-
-        # Qualquer melhora relevante libera o produto imediatamente, mesmo dentro das 12h.
-        if price_better or discount_better:
-            return True
-
-        same_price = abs(current_price - last_price) < 0.01
-        same_discount = abs(current_discount - last_discount) < 0.01
-
-        # Oferta pior (ou diferente sem nenhuma melhora) nunca é repetida.
-        if not (same_price and same_discount):
-            return False
-
-        # Oferta exatamente igual só pode repetir depois do intervalo configurado.
-        sent_at = last.get("sent_at")
-        if isinstance(sent_at, str):
-            try:
-                sent_at = datetime.fromisoformat(sent_at.replace("Z", "+00:00"))
-            except ValueError:
-                return False
-        if sent_at is None:
-            return False
-        if sent_at.tzinfo is None:
-            sent_at = sent_at.replace(tzinfo=timezone.utc)
-
-        min_age = timedelta(hours=max(0, settings.fixed_product_cooldown_hours))
-        return datetime.now(timezone.utc) - sent_at >= min_age
-
-    def notification_price_drop_percent(self, product: Product, group_key: str) -> float:
-        last = self.last_notification(product, group_key)
-        if not last:
-            return 0.0
-        last_price = float(last.get("price") or 0.0)
-        current_price = float(product.price or 0.0)
-        if last_price <= 0 or current_price <= 0 or current_price >= last_price:
-            return 0.0
-        return (1.0 - current_price / last_price) * 100.0
-
-    def is_price_drop_exception(self, product: Product, group_key: str) -> bool:
-        return self.notification_price_drop_percent(product, group_key) >= settings.min_price_drop_percent
-
-    def can_notify(self, product: Product, group_key: str) -> bool:
-        last = self.last_notification(product, group_key)
-        if last is None:
-            return True
-        if self.is_price_drop_exception(product, group_key):
-            return True
-        hours = settings.general_product_cooldown_hours if group_key == "geral" else settings.specific_product_cooldown_hours
-        sent_at = last.get("sent_at")
-        if isinstance(sent_at, str):
-            try:
-                sent_at = datetime.fromisoformat(sent_at.replace("Z", "+00:00"))
-            except ValueError:
-                return False
-        if sent_at is None:
-            return False
-        if sent_at.tzinfo is None:
-            sent_at = sent_at.replace(tzinfo=timezone.utc)
-        return datetime.now(timezone.utc) - sent_at >= timedelta(hours=max(0, hours))
-
-    def recent_general_source_groups(self, minutes: int | None = None) -> set[str]:
-        window = max(1, int(minutes if minutes is not None else settings.general_category_cooldown_minutes))
-        since = datetime.now(timezone.utc) - timedelta(minutes=window)
-        if not self.is_postgres:
-            since = since.isoformat()
-        p = self._ph
-        sql = f"""
-            SELECT DISTINCT source_group_key
-            FROM product_notifications
-            WHERE group_key = {p}
-              AND source_group_key IS NOT NULL
-              AND source_group_key <> ''
-              AND sent_at >= {p}
-        """
-        with self._connect() as conn:
-            rows = conn.execute(sql, ("geral", since)).fetchall()
-        return {str(row["source_group_key"]) for row in rows if row["source_group_key"]}
-
-    def recent_general_variety_keys(self, hours: int | None = None) -> set[str]:
-        window = max(1, int(hours if hours is not None else settings.general_type_cooldown_hours))
-        since = datetime.now(timezone.utc) - timedelta(hours=window)
-        if not self.is_postgres:
-            since = since.isoformat()
-        p = self._ph
-        sql = f"""
-            SELECT DISTINCT variety_key
-            FROM product_notifications
-            WHERE group_key = {p}
-              AND variety_key IS NOT NULL
-              AND variety_key <> ''
-              AND sent_at >= {p}
-        """
-        with self._connect() as conn:
-            rows = conn.execute(sql, ("geral", since)).fetchall()
-        return {str(row["variety_key"]) for row in rows if row["variety_key"]}
-
-    def mark_notified(self, product: Product, group_key: str, *, source_group_key: str | None = None, variety_key: str | None = None) -> None:
+    def mark_notified(self, product: Product, group_key: str) -> None:
         sent_at = datetime.now(timezone.utc)
         if not self.is_postgres:
             sent_at = sent_at.isoformat()
+
         p = self._ph
         sql = f"""
             INSERT INTO product_notifications
-            (catalog_product_key, item_key, group_key, price, discount_percent, source_group_key, variety_key, product_name, sent_at)
-            VALUES ({p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p})
+            (catalog_product_key, item_key, group_key, price, discount_percent, sent_at)
+            VALUES ({p}, {p}, {p}, {p}, {p}, {p})
         """
         with self._connect() as conn:
-            conn.execute(sql, (self.notification_key(product), product.item_id, group_key, product.price or 0, product.discount_percent, source_group_key, variety_key, product.name, sent_at))
+            conn.execute(
+                sql,
+                (
+                    self.notification_key(product),
+                    product.item_id,
+                    group_key,
+                    product.price or 0,
+                    product.discount_percent,
+                    sent_at,
+                ),
+            )
 
     def count_group_notifications_since(self, group_key: str, minutes: int = 60) -> int:
         """Conta envios confirmados a um grupo dentro de uma janela móvel.
@@ -621,11 +486,11 @@ class Database:
             INSERT INTO offer_candidates (
                 catalog_product_key, product_id, item_id, name, category_id,
                 domain_id, price, original_price, currency_id, permalink,
-                picture, forced_group, discovery_source, marketplace, group_key,
+                picture, forced_group, discovery_source, group_key,
                 previous_price, drop_percent, score, updated_at
             ) VALUES (
                 {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p},
-                {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}
+                {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}
             )
             ON CONFLICT(catalog_product_key) DO UPDATE SET
                 product_id = excluded.product_id,
@@ -640,7 +505,6 @@ class Database:
                 picture = excluded.picture,
                 forced_group = excluded.forced_group,
                 discovery_source = excluded.discovery_source,
-                marketplace = excluded.marketplace,
                 group_key = excluded.group_key,
                 previous_price = excluded.previous_price,
                 drop_percent = excluded.drop_percent,
@@ -654,8 +518,7 @@ class Database:
                     c["name"], c.get("category_id"), c.get("domain_id"), c["price"],
                     c.get("original_price"), c.get("currency_id") or "BRL",
                     c["permalink"], c.get("picture"), c.get("forced_group"),
-                    c.get("discovery_source"), c.get("marketplace") or "mercado_livre",
-                    c["group_key"], c.get("previous_price"),
+                    c.get("discovery_source"), c["group_key"], c.get("previous_price"),
                     c.get("drop_percent", 0.0), c.get("score", 0.0), stored_now,
                 ))
         return len(candidates)
@@ -728,3 +591,4 @@ class Database:
             }
             for row in rows
         ]
+

@@ -1,271 +1,389 @@
 import express from "express";
-import pg from "pg";
-import { createVideoHandler, DEFAULT_VIDEO_PHONE } from "./video-delivery.js";
-import { timingSafeEqual } from "node:crypto";
+import fs from "node:fs";
+import { Pool } from "pg";
 import qrcodeTerminal from "qrcode-terminal";
 import QRCode from "qrcode";
 import pino from "pino";
-import makeWASocket, {
-  DisconnectReason,
-  useMultiFileAuthState,
-} from "@whiskeysockets/baileys";
-import { Boom } from "@hapi/boom";
+import makeWASocket, { DisconnectReason, useMultiFileAuthState } from "@whiskeysockets/baileys";
 import { useNeonAuthState } from "./neon-auth.js";
+import { Boom } from "@hapi/boom";
 
 const app = express();
-// Authenticate before parsing the potentially large video payload.
-app.use('/send/video-asset', (req, res, next) => {
-  if (!directSendAuthorized(req)) return res.status(401).json({ error: 'Nao autorizado.' });
-  next();
-}, express.json({ limit: '22mb' }));
 app.use(express.json({ limit: "1mb" }));
 
 let sock = null;
 let ready = false;
 let latestQr = null;
-let reconnectTimer = null;
+const communityRate = new Map();
 
-async function connectWhatsApp() {
-  const databaseUrl = process.env.DATABASE_URL?.trim();
+const BUILTIN_CATEGORIES = {
+  eletronicos_tecnologia: "Eletrônicos e Tecnologia",
+  moda_vestuario: "Moda e Vestuário",
+  celulares_acessorios: "Celulares e Acessórios",
+  games_acessorios: "Games e Acessórios",
+  utilidades_domesticas: "Utilidades Domésticas",
+  pet_shop: "Pet Shop"
+};
 
-  const authProvider = databaseUrl
-    ? await useNeonAuthState(databaseUrl)
-    : await useMultiFileAuthState("auth_info");
+const databaseUrl = process.env.DATABASE_URL?.trim();
+const adminPool = databaseUrl ? new Pool({ connectionString: databaseUrl }) : null;
+let adminTableReady = false;
 
-  const { state, saveCreds } = authProvider;
+function builtinGroupIds() {
+  return {
+    eletronicos_tecnologia: process.env.WA_GROUP_ELETRONICOS?.trim() || null,
+    moda_vestuario: process.env.WA_GROUP_MODA?.trim() || null,
+    celulares_acessorios: process.env.WA_GROUP_CELULARES?.trim() || null,
+    games_acessorios: process.env.WA_GROUP_GAMES?.trim() || null,
+    utilidades_domesticas: process.env.WA_GROUP_UTILIDADES?.trim() || null,
+    pet_shop: process.env.WA_GROUP_PET?.trim() || null
+  };
+}
 
-  console.log(
-    databaseUrl
-      ? "[whatsapp] sessao persistida no PostgreSQL/Neon."
-      : "[whatsapp] DATABASE_URL ausente; usando auth_info local."
+async function ensureAdminTable() {
+  if (!adminPool) throw new Error("DATABASE_URL não configurada.");
+  if (adminTableReady) return;
+
+  await adminPool.query(`
+    CREATE TABLE IF NOT EXISTS admin_monitored_products (
+      id BIGSERIAL PRIMARY KEY,
+      product_id TEXT NOT NULL UNIQUE,
+      group_key TEXT NOT NULL,
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await adminPool.query(`CREATE INDEX IF NOT EXISTS idx_admin_monitored_products_active ON admin_monitored_products(active, group_key)`);
+
+  await adminPool.query(`
+    CREATE TABLE IF NOT EXISTS auvello_categories (
+      id BIGSERIAL PRIMARY KEY,
+      group_key TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL,
+      whatsapp_group_id TEXT,
+      search_term TEXT,
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      public_visible BOOLEAN NOT NULL DEFAULT TRUE,
+      mirror_to_general BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await adminPool.query(`CREATE INDEX IF NOT EXISTS idx_auvello_categories_active ON auvello_categories(active, public_visible)`);
+
+  await adminPool.query(`
+    CREATE TABLE IF NOT EXISTS community_requests (
+      id BIGSERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      whatsapp TEXT NOT NULL,
+      reference_url TEXT NOT NULL,
+      reference_product_id TEXT,
+      desired_item TEXT NOT NULL,
+      suggested_group_key TEXT NOT NULL,
+      approved_group_key TEXT,
+      approved_search_term TEXT,
+      notes TEXT,
+      status TEXT NOT NULL DEFAULT 'pendente',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await adminPool.query(`CREATE INDEX IF NOT EXISTS idx_community_requests_status ON community_requests(status, approved_group_key, created_at)`);
+
+  const ids = builtinGroupIds();
+  for (const [groupKey, name] of Object.entries(BUILTIN_CATEGORIES)) {
+    await adminPool.query(
+      `INSERT INTO auvello_categories
+       (group_key, name, whatsapp_group_id, active, public_visible, mirror_to_general, created_at, updated_at)
+       VALUES ($1,$2,$3,TRUE,TRUE,TRUE,NOW(),NOW())
+       ON CONFLICT(group_key) DO NOTHING`,
+      [groupKey, name, ids[groupKey]]
+    );
+  }
+
+  adminTableReady = true;
+}
+
+async function listCategories({ activeOnly = false, publicOnly = false } = {}) {
+  await ensureAdminTable();
+  const conditions = [];
+  if (activeOnly) conditions.push("active=TRUE");
+  if (publicOnly) conditions.push("public_visible=TRUE");
+  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+  const { rows } = await adminPool.query(`
+    SELECT id, group_key, name, whatsapp_group_id, search_term,
+           active, public_visible, mirror_to_general, created_at, updated_at
+    FROM auvello_categories
+    ${where}
+    ORDER BY name ASC
+  `);
+  return rows;
+}
+
+async function getCategoryByKey(groupKey, { activeOnly = false } = {}) {
+  await ensureAdminTable();
+  const { rows } = await adminPool.query(
+    `SELECT id, group_key, name, whatsapp_group_id, search_term,
+            active, public_visible, mirror_to_general, created_at, updated_at
+     FROM auvello_categories
+     WHERE group_key=$1 ${activeOnly ? "AND active=TRUE" : ""}
+     LIMIT 1`,
+    [groupKey]
   );
-
-  sock = makeWASocket({
-    auth: state,
-    logger: pino({ level: "silent" }),
-    printQRInTerminal: false,
-    syncFullHistory: false,
-    markOnlineOnConnect: false,
-  });
-
-  sock.ev.on("creds.update", saveCreds);
-
-  sock.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
-    if (qr) {
-      latestQr = qr;
-      console.log("\nQR Code atualizado. Abra /qr?key=SEU_QR_SECRET no navegador.\n");
-      qrcodeTerminal.generate(qr, { small: true });
-    }
-
-    if (connection === "open") {
-      ready = true;
-      latestQr = null;
-      console.log("WhatsApp conectado.");
-    }
-
-    if (connection === "close") {
-      ready = false;
-      latestQr = null;
-
-      const error = lastDisconnect?.error;
-      const statusCode =
-        error instanceof Boom ? error.output?.statusCode : undefined;
-
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-
-      console.log(
-        "WhatsApp desconectado.",
-        shouldReconnect ? "Reconectando..." : "Sessao encerrada."
-      );
-
-      if (reconnectTimer) {
-        clearTimeout(reconnectTimer);
-        reconnectTimer = null;
-      }
-
-      if (shouldReconnect) {
-        reconnectTimer = setTimeout(() => {
-          reconnectTimer = null;
-          connectWhatsApp().catch((err) =>
-            console.error("[whatsapp] falha ao reconectar:", err)
-          );
-        }, 3000);
-      }
-    }
-  });
+  return rows[0] || null;
 }
 
-app.get("/health", (_req, res) => {
-  res.json({
-    ok: true,
-    whatsappReady: ready,
-  });
-});
-
-app.get("/qr", async (req, res) => {
-  const configuredSecret = process.env.QR_SECRET?.trim();
-  const supplied = String(req.query.key || "").trim();
-
-  if (!configuredSecret || supplied !== configuredSecret) {
-    return res.status(401).send("Nao autorizado.");
+function adminAuth(req, res, next) {
+  const expectedUser = process.env.ADMIN_USER?.trim();
+  const expectedPassword = process.env.ADMIN_PASSWORD || "";
+  if (!expectedUser || !expectedPassword) {
+    return res.status(503).send("Auvello Admin desativado. Configure ADMIN_USER e ADMIN_PASSWORD no Render.");
   }
-
-  if (ready) {
-    return res.status(200).type("html").send("<h2>WhatsApp conectado ✅</h2>");
+  const auth = req.headers.authorization || "";
+  if (!auth.startsWith("Basic ")) {
+    res.set("WWW-Authenticate", 'Basic realm="Auvello Admin", charset="UTF-8"');
+    return res.status(401).send("Autenticação necessária.");
   }
-
-  if (!latestQr) {
-    return res
-      .status(200)
-      .type("html")
-      .send(
-        '<meta http-equiv="refresh" content="3"><h2>Aguardando QR Code...</h2>'
-      );
+  let decoded = "";
+  try { decoded = Buffer.from(auth.slice(6), "base64").toString("utf8"); } catch (_error) { decoded = ""; }
+  const separator = decoded.indexOf(":");
+  const user = separator >= 0 ? decoded.slice(0, separator) : "";
+  const password = separator >= 0 ? decoded.slice(separator + 1) : "";
+  if (user !== expectedUser || password !== expectedPassword) {
+    res.set("WWW-Authenticate", 'Basic realm="Auvello Admin", charset="UTF-8"');
+    return res.status(401).send("Usuário ou senha inválidos.");
   }
-
-  try {
-    const dataUrl = await QRCode.toDataURL(latestQr, {
-      errorCorrectionLevel: "M",
-      margin: 2,
-      width: 420,
-    });
-
-    return res.status(200).type("html").send(
-      `<h2>Conectar WhatsApp ao Auvello</h2>
-       <img src="${dataUrl}" style="max-width:100%">`
-    );
-  } catch (_error) {
-    return res.status(500).send("Nao foi possivel gerar o QR Code.");
-  }
-});
-
-app.get("/groups", async (_req, res) => {
-  if (!ready || !sock) {
-    return res.status(503).json({
-      error: "WhatsApp ainda nao conectado.",
-    });
-  }
-
-  try {
-    const groups = await sock.groupFetchAllParticipating();
-
-    return res.json(
-      Object.values(groups).map((group) => ({
-        id: group.id,
-        subject: group.subject,
-      }))
-    );
-  } catch (error) {
-    return res.status(500).json({
-      error: String(error),
-    });
-  }
-});
-
-app.post("/send", async (req, res) => {
-  if (!ready || !sock) {
-    return res.status(503).json({
-      error: "WhatsApp ainda nao conectado.",
-    });
-  }
-
-  const { groupId, message, imageUrl } = req.body || {};
-
-  if (!groupId || !message) {
-    return res.status(400).json({
-      error: "Informe groupId e message.",
-    });
-  }
-
-  if (!String(groupId).endsWith("@g.us")) {
-    return res.status(400).json({
-      error: "groupId deve terminar com @g.us.",
-    });
-  }
-
-  try {
-    const result = imageUrl
-      ? await sock.sendMessage(groupId, {
-          image: { url: imageUrl },
-          caption: message,
-        })
-      : await sock.sendMessage(groupId, {
-          text: message,
-        });
-
-    return res.json({
-      ok: true,
-      id: result?.key?.id || null,
-    });
-  } catch (error) {
-    console.error("[whatsapp/send]", error);
-
-    return res.status(500).json({
-      error: String(error),
-    });
-  }
-});
-
-function directSendAuthorized(req) {
-  const configured = process.env.WHATSAPP_API_SECRET?.trim() || "";
-  const supplied = String(req.get("x-auvello-key") || "").trim();
-  if (!configured || !supplied) return false;
-  const expectedBuffer = Buffer.from(configured);
-  const suppliedBuffer = Buffer.from(supplied);
-  return expectedBuffer.length === suppliedBuffer.length
-    && timingSafeEqual(expectedBuffer, suppliedBuffer);
+  next();
 }
 
-app.post("/send/direct", async (req, res) => {
-  if (!directSendAuthorized(req)) {
-    return res.status(401).json({ error: "Nao autorizado." });
-  }
-  if (!ready || !sock) {
-    return res.status(503).json({ error: "WhatsApp ainda nao conectado." });
-  }
+function extractProductId(value) {
+  const text = String(value || "").trim().toUpperCase();
+  const direct = text.match(/^MLB\d+$/);
+  if (direct) return direct[0];
+  const fromCatalogUrl = text.match(/\/P\/(MLB\d+)/);
+  if (fromCatalogUrl) return fromCatalogUrl[1];
+  const anywhere = text.match(/\b(MLB\d{5,})\b/);
+  return anywhere ? anywhere[1] : null;
+}
 
-  const rawPhone = String(req.body?.phone || "").replace(/\D/g, "");
-  const phone = rawPhone.startsWith("55") ? rawPhone : `55${rawPhone}`;
-  const message = String(req.body?.message || "").trim().slice(0, 4000);
+function normalizeText(value, maxLength = 300) {
+  return String(value || "").trim().replace(/\s+/g, " ").slice(0, maxLength);
+}
 
-  if (!/^55\d{10,11}$/.test(phone) || !message) {
-    return res.status(400).json({ error: "Informe phone com DDD e message." });
-  }
+function normalizeWhatsapp(value) {
+  return String(value || "").replace(/[^0-9+()\-\s]/g, "").trim().slice(0, 30);
+}
 
+function validateMercadoLivreUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
   try {
-    const requestedJid = `${phone}@s.whatsapp.net`;
-    const matches = await sock.onWhatsApp(requestedJid);
-    const destination = matches?.find((item) => item.exists)?.jid;
-    if (!destination) {
-      return res.status(404).json({ error: "O numero informado nao possui WhatsApp." });
-    }
+    const url = new URL(raw);
+    const host = url.hostname.toLowerCase();
+    const validHost = host === "mercadolivre.com.br" || host.endsWith(".mercadolivre.com.br") || host === "mercadolibre.com" || host.endsWith(".mercadolibre.com");
+    if (!validHost || !["http:", "https:"].includes(url.protocol)) return null;
+    return url.toString().slice(0, 2000);
+  } catch (_error) { return null; }
+}
 
-    const result = await sock.sendMessage(destination, { text: message });
-    return res.json({ ok: true, id: result?.key?.id || null });
+function normalizeGroupId(value) {
+  const v = String(value || "").trim();
+  if (!v) return null;
+  return v.endsWith("@g.us") ? v.slice(0, 180) : null;
+}
+
+function slugifyGroupKey(value) {
+  return normalizeText(value, 100)
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "")
+    .slice(0, 70);
+}
+
+function communityRateAllowed(req) {
+  const now = Date.now();
+  const windowMs = 60 * 60 * 1000;
+  const limit = 5;
+  const key = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "unknown").split(",")[0].trim();
+  const recent = (communityRate.get(key) || []).filter(ts => now - ts < windowMs);
+  if (recent.length >= limit) return false;
+  recent.push(now); communityRate.set(key, recent); return true;
+}
+
+function isInStaticWatchlist(productId) {
+  try {
+    const raw = fs.readFileSync("watchlist.json", "utf8");
+    const data = JSON.parse(raw);
+    const ids = Array.isArray(data.product_identifiers) ? data.product_identifiers : [];
+    return ids.some((id) => String(id).trim().toUpperCase() === productId);
+  } catch (_error) { return false; }
+}
+
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+app.get("/pedir-oferta", async (_req, res) => {
+  let categories = [];
+  try { categories = await listCategories({ activeOnly: true, publicOnly: true }); }
+  catch (error) { console.error("[community] categorias públicas:", error); }
+  const options = categories.map(c => `<option value="${esc(c.group_key)}">${esc(c.name)}</option>`).join("");
+  res.status(200).type("html").send(`<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pedir uma oferta - Auvello</title>
+<style>
+:root{color-scheme:dark;--bg:#090d0b;--panel:#111815;--green:#36e676;--text:#f3f7f4;--muted:#93a69b;--border:#26362e}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at top,#183023 0,#090d0b 42%);font-family:Inter,Arial,sans-serif;color:var(--text)}.wrap{max-width:760px;margin:0 auto;padding:30px 18px 70px}.brand{display:flex;gap:14px;align-items:center;margin-bottom:24px}.logo{width:52px;height:52px;border-radius:15px;background:linear-gradient(145deg,#48f98a,#168c48);display:grid;place-items:center;color:#07120b;font-size:27px;font-weight:900}.brand h1{margin:0;font-size:25px}.brand p{margin:4px 0 0;color:var(--muted)}.card{background:#111815ee;border:1px solid var(--border);border-radius:20px;padding:22px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.full{grid-column:1/-1}label{display:block;font-size:13px;font-weight:750;margin-bottom:7px}.help{font-size:12px;color:var(--muted);line-height:1.45;margin-top:6px}input,select,textarea,button{width:100%;border-radius:11px;border:1px solid var(--border);font:inherit}input,select,textarea{background:#0c120f;color:var(--text);padding:12px 13px;outline:none}input,select{height:46px}textarea{min-height:92px;resize:vertical}button{height:50px;background:var(--green);color:#06200f;font-weight:900;cursor:pointer;border:none}.notice{padding:14px 15px;border-radius:13px;background:#171b13;border:1px solid #4b4524;color:#e8e2c8;font-size:13px;line-height:1.55}.msg{min-height:22px;margin-top:13px;font-size:14px;color:var(--muted)}.msg.ok{color:var(--green)}.msg.err{color:#ff9090}.honeypot{position:absolute;left:-10000px;opacity:0;pointer-events:none}@media(max-width:650px){.grid{grid-template-columns:1fr}.full{grid-column:auto}}
+</style></head><body><div class="wrap">
+<div class="brand"><div class="logo">A</div><div><h1>Ajude o Auvello a buscar melhor</h1><p>Envie um interesse de oferta para análise.</p></div></div>
+<div class="card"><div class="grid">
+<div><label for="name">Nome</label><input id="name" maxlength="80" autocomplete="name" placeholder="Seu nome"></div>
+<div><label for="whatsapp">WhatsApp para contato</label><input id="whatsapp" maxlength="30" inputmode="tel" autocomplete="tel" placeholder="(27) 99999-9999"><div class="help"><strong>Usaremos este número apenas se precisarmos esclarecer ou dar retorno sobre sua solicitação.</strong></div></div>
+<div class="full notice"><strong>Informe pelo menos uma das duas opções abaixo:</strong> descreva o que procura <strong>ou</strong> cole um link do Mercado Livre. Você também pode preencher os dois.</div>
+<div class="full"><label for="desiredItem">O que você gostaria que o Auvello buscasse? (opcional se enviar link)</label><input id="desiredItem" maxlength="180" placeholder="Ex.: SSD NVMe 1TB, ração para gatos adultos, Air Fryer 5L"></div>
+<div class="full"><label for="referenceUrl">Link de referência do Mercado Livre (opcional se descrever)</label><input id="referenceUrl" maxlength="2000" inputmode="url" placeholder="https://www.mercadolivre.com.br/..."><div class="help">Se você só tiver o link, pode enviar assim. O Auvello poderá definir manualmente o termo de busca durante a análise.</div></div>
+<div><label for="groupKey">Categoria / grupo sugerido</label><select id="groupKey">${options}</select><div class="help">É apenas uma sugestão e pode ser ajustada na análise.</div></div>
+<div><label for="notes">Observação (opcional)</label><textarea id="notes" maxlength="500" placeholder="Ex.: prefiro pacote de 10 kg ou mais"></textarea></div>
+<div class="honeypot"><input id="company" tabindex="-1" autocomplete="off"></div>
+<div class="full notice"><strong>Importante:</strong> o link é referência. A solicitação não garante o monitoramento daquele anúncio específico. Se aprovada, o Auvello transforma o pedido em um termo de busca associado à categoria correta.</div>
+<div class="full"><button id="send">ENVIAR SOLICITAÇÃO</button><div id="message" class="msg"></div></div>
+</div></div></div>
+<script>
+const $=id=>document.getElementById(id);const msg=(t,k='')=>{$('message').textContent=t;$('message').className='msg '+k;};
+$('send').addEventListener('click',async()=>{const payload={name:$('name').value.trim(),whatsapp:$('whatsapp').value.trim(),referenceUrl:$('referenceUrl').value.trim(),desiredItem:$('desiredItem').value.trim(),groupKey:$('groupKey').value,notes:$('notes').value.trim(),company:$('company').value};if(!payload.name||!payload.whatsapp)return msg('Preencha nome e WhatsApp.','err');if(!payload.referenceUrl&&!payload.desiredItem)return msg('Informe o que deseja encontrar ou um link do Mercado Livre.','err');if(!payload.groupKey)return msg('Selecione uma categoria.','err');$('send').disabled=true;msg('Enviando...');try{const r=await fetch('/api/community/requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||'Não foi possível enviar.');msg('Solicitação enviada! Ela ficará pendente até a análise do Auvello.','ok');$('referenceUrl').value='';$('desiredItem').value='';$('notes').value='';}catch(e){msg(e.message,'err');}finally{$('send').disabled=false;}});
+</script></body></html>`);
+});
+
+app.post("/api/community/requests", async (req, res) => {
+  if (!communityRateAllowed(req)) return res.status(429).json({ error: "Muitas solicitações em pouco tempo. Tente novamente mais tarde." });
+  if (req.body?.company) return res.status(201).json({ ok: true });
+  const name = normalizeText(req.body?.name, 80);
+  const whatsapp = normalizeWhatsapp(req.body?.whatsapp);
+  const rawReference = String(req.body?.referenceUrl || "").trim();
+  const referenceUrl = rawReference ? validateMercadoLivreUrl(rawReference) : null;
+  const desiredItem = normalizeText(req.body?.desiredItem, 180);
+  const suggestedGroupKey = String(req.body?.groupKey || "").trim();
+  const notes = normalizeText(req.body?.notes, 500) || null;
+  if (name.length < 2) return res.status(400).json({ error: "Informe seu nome." });
+  if (whatsapp.replace(/\D/g, "").length < 10) return res.status(400).json({ error: "Informe um WhatsApp válido para contato." });
+  if (!desiredItem && !rawReference) return res.status(400).json({ error: "Informe o que deseja encontrar ou um link do Mercado Livre." });
+  if (rawReference && !referenceUrl) return res.status(400).json({ error: "O link informado não é um link válido do Mercado Livre." });
+  const category = await getCategoryByKey(suggestedGroupKey, { activeOnly: true }).catch(() => null);
+  if (!category || !category.public_visible) return res.status(400).json({ error: "Categoria sugerida inválida." });
+  try {
+    const referenceProductId = referenceUrl ? extractProductId(referenceUrl) : null;
+    const { rows } = await adminPool.query(
+      `INSERT INTO community_requests
+       (name, whatsapp, reference_url, reference_product_id, desired_item, suggested_group_key, notes, status, created_at, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'pendente',NOW(),NOW()) RETURNING id,status,created_at`,
+      [name, whatsapp, referenceUrl || "", referenceProductId, desiredItem || "", suggestedGroupKey, notes]
+    );
+    console.log(`[community] nova solicitação #${rows[0].id}: ${desiredItem || "[somente link]"} -> ${suggestedGroupKey}`);
+    res.status(201).json({ ok: true, request: rows[0] });
+  } catch (error) { console.error("[community] create:", error); res.status(500).json({ error: "Não foi possível registrar sua solicitação." }); }
+});
+
+app.get("/admin", adminAuth, (_req, res) => {
+  res.status(200).type("html").send(`<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Auvello Admin</title>
+<style>
+:root{color-scheme:dark;--bg:#090d0b;--panel:#111815;--green:#36e676;--text:#f3f7f4;--muted:#8fa298;--border:#26362e}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top,#14231b 0,#090d0b 40%);font-family:Inter,Arial,sans-serif;color:var(--text);min-height:100vh}.wrap{max-width:1180px;margin:0 auto;padding:28px 18px 70px}.brand{display:flex;gap:14px;align-items:center;margin-bottom:24px}.logo{width:48px;height:48px;border-radius:14px;background:linear-gradient(145deg,#48f98a,#168c48);display:grid;place-items:center;color:#07120b;font-size:25px;font-weight:900}.brand h1{margin:0;font-size:24px}.brand p{margin:4px 0 0;color:var(--muted)}.card{background:#111815e8;border:1px solid var(--border);border-radius:18px;padding:20px;margin-bottom:18px}h2{font-size:17px;margin:0 0 16px}.form{display:grid;grid-template-columns:1.3fr 1.2fr 1.2fr auto;gap:10px}.form3{display:grid;grid-template-columns:1.5fr 1fr auto;gap:10px}input,select,textarea,button{border-radius:11px;border:1px solid var(--border);font:inherit}input,select,textarea{background:#0c120f;color:var(--text);padding:0 13px;outline:none}input,select{height:46px}textarea{padding:10px 13px;min-height:70px}button{height:46px;padding:0 17px;background:var(--green);color:#06200f;font-weight:800;cursor:pointer;border:none}button.secondary{background:#25332c;color:var(--text)}button.danger{background:#321b1b;color:#ffaaaa;border:1px solid #5e2b2b}.checks{display:flex;gap:16px;flex-wrap:wrap;margin:12px 0}.checks label{font-size:13px;color:#cbd6cf}.checks input{height:auto;width:auto}.msg{margin-top:12px;min-height:20px;color:var(--muted);font-size:14px}.msg.ok{color:var(--green)}.msg.err{color:#ff8d8d}.tablewrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:850px}th,td{text-align:left;padding:12px 9px;border-bottom:1px solid var(--border);font-size:13px;vertical-align:top}th{color:var(--muted);font-size:11px;text-transform:uppercase}.pill{display:inline-block;padding:5px 9px;border-radius:99px;font-size:12px;font-weight:700;background:#183425;color:#65f49c}.pill.off{background:#332828;color:#c7aaa9}.actions{display:flex;gap:7px;flex-wrap:wrap}.actions button{height:34px;padding:0 10px;font-size:12px}.empty{color:var(--muted);padding:18px 0}.hint{font-size:13px;color:var(--muted);margin-top:10px;line-height:1.5}.topline{display:flex;align-items:center;justify-content:space-between;gap:12px}.refresh{height:36px!important;background:#25332c!important;color:var(--text)!important}.request{border:1px solid var(--border);border-radius:15px;padding:15px;margin:11px 0;background:#0d1410}.request-head{display:flex;justify-content:space-between;gap:12px}.request h3{margin:0 0 5px;font-size:16px}.meta,.note{color:#aab9b0;font-size:12px;line-height:1.5}.note{margin-top:9px;font-size:13px}.request-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:13px}.request-grid label{display:block;color:var(--muted);font-size:11px;margin-bottom:5px}.request-grid input,.request-grid select{width:100%;height:40px}.community-actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:12px}.community-actions button{height:36px;font-size:12px}.cat-edit{display:grid;grid-template-columns:1fr 1fr;gap:6px}.cat-edit input,.cat-edit select{height:36px;width:100%}@media(max-width:780px){.form,.form3{grid-template-columns:1fr}.request-grid{grid-template-columns:1fr}.cat-edit{grid-template-columns:1fr}}
+</style></head><body><div class="wrap"><div class="brand"><div class="logo">A</div><div><h1>Auvello Admin</h1><p>Categorias, grupos, produtos fixados e pedidos da comunidade</p></div></div>
+<section class="card"><h2>Categorias e grupos</h2><div class="form"><input id="catName" placeholder="Nome da nova categoria"><input id="catSearch" placeholder="Busca automática (opcional)"><select id="catWhatsApp"><option value="">Sem grupo por enquanto</option></select><button id="catAdd">+ CRIAR</button></div><div class="checks"><label><input type="checkbox" id="catPublic" checked> Exibir no formulário público</label><label><input type="checkbox" id="catMirror" checked> Espelhar ofertas no Geral</label></div><div class="hint">Crie o grupo no WhatsApp, depois selecione-o aqui. Se preencher “Busca automática”, a descoberta central pesquisará esse termo e direcionará as ofertas para esta categoria. Sem termo, a categoria ainda pode receber produtos fixados e pedidos aprovados.</div><div id="catMessage" class="msg"></div><div class="tablewrap"><div id="categories" class="empty">Carregando...</div></div></section>
+<section class="card"><h2>Adicionar produto ao monitoramento permanente</h2><div class="form3"><input id="product" placeholder="MLB29089153 ou link completo do Mercado Livre"><select id="group"></select><button id="add">+ ADICIONAR</button></div><div class="hint">O produto continua precisando passar pelos critérios atuais. O grupo Geral não é selecionável: ofertas específicas podem ser espelhadas para ele automaticamente.</div><div id="message" class="msg"></div></section>
+<section class="card"><div class="topline"><h2>Produtos fixados</h2><button class="refresh" id="refresh">Atualizar</button></div><div class="tablewrap"><div id="content" class="empty">Carregando...</div></div></section>
+<section class="card"><div class="topline"><div><h2>Pedidos da Comunidade</h2><div class="hint" style="margin-top:-8px">O usuário pode enviar descrição, link, ou ambos. Para aprovar, você define manualmente o termo que será pesquisado e a categoria.</div></div><button class="refresh" id="refreshRequests">Atualizar</button></div><div id="requests" class="empty">Carregando...</div></section>
+</div><script>
+const $=id=>document.getElementById(id);const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));const fmtDate=v=>v?new Date(v).toLocaleString('pt-BR'):'—';const money=v=>v==null?'—':Number(v).toLocaleString('pt-BR',{style:'currency',currency:'BRL'});async function api(url,options={}){const r=await fetch(url,{headers:{'Content-Type':'application/json',...(options.headers||{})},...options});const d=await r.json().catch(()=>({}));if(!r.ok){const e=new Error(d.error||'Erro na requisição');e.status=r.status;e.data=d;throw e;}return d;}
+let CATEGORIES=[];let WA_GROUPS=[];const catMap=()=>Object.fromEntries(CATEGORIES.map(c=>[c.group_key,c.name]));function activeOptions(selected=''){return CATEGORIES.filter(c=>c.active).map(c=>'<option value="'+esc(c.group_key)+'" '+(c.group_key===selected?'selected':'')+'>'+esc(c.name)+'</option>').join('');}function waOptions(selected=''){const known=WA_GROUPS.some(g=>g.id===selected);const extra=selected&&!known?'<option value="'+esc(selected)+'" selected>Grupo atual — '+esc(selected)+'</option>':'';return '<option value="">Sem grupo</option>'+extra+WA_GROUPS.map(g=>'<option value="'+esc(g.id)+'" '+(g.id===selected?'selected':'')+'>'+esc(g.subject)+' — '+esc(g.id)+'</option>').join('');}
+async function loadWhatsAppGroups(){try{const d=await api('/api/admin/whatsapp-groups');WA_GROUPS=d.groups||[];}catch(_e){WA_GROUPS=[];}}
+async function loadCategories(){const d=await api('/api/admin/categories');CATEGORIES=d.categories||[];$('group').innerHTML=activeOptions();$('catWhatsApp').innerHTML=waOptions();if(!CATEGORIES.length){$('categories').innerHTML='<div class="empty">Nenhuma categoria.</div>';return;}$('categories').innerHTML='<table><thead><tr><th>Categoria</th><th>Busca automática</th><th>Grupo WhatsApp</th><th>Opções</th><th>Ações</th></tr></thead><tbody>'+CATEGORIES.map(c=>'<tr data-cat="'+c.id+'"><td><strong>'+esc(c.name)+'</strong><br><small>'+esc(c.group_key)+'</small></td><td><input data-f="search" value="'+esc(c.search_term||'')+'" placeholder="Opcional"></td><td><select data-f="wa">'+waOptions(c.whatsapp_group_id||'')+'</select></td><td><label><input data-f="active" type="checkbox" '+(c.active?'checked':'')+'> ativo</label><br><label><input data-f="public" type="checkbox" '+(c.public_visible?'checked':'')+'> público</label><br><label><input data-f="mirror" type="checkbox" '+(c.mirror_to_general?'checked':'')+'> → Geral</label></td><td class="actions"><button data-action="save">Salvar</button><button class="danger" data-action="delete">Excluir</button></td></tr>').join('')+'</tbody></table>';$('categories').querySelectorAll('[data-cat]').forEach(row=>{row.querySelector('[data-action="save"]').onclick=()=>saveCategory(row);row.querySelector('[data-action="delete"]').onclick=()=>deleteCategory(row);});}
+async function createCategory(){const name=$('catName').value.trim(),searchTerm=$('catSearch').value.trim(),whatsappGroupId=$('catWhatsApp').value;if(!name)return $('catMessage').textContent='Informe o nome da categoria.';try{await api('/api/admin/categories',{method:'POST',body:JSON.stringify({name,searchTerm,whatsappGroupId,publicVisible:$('catPublic').checked,mirrorToGeneral:$('catMirror').checked})});$('catName').value='';$('catSearch').value='';$('catMessage').textContent='Categoria criada.';await loadCategories();await loadProducts();await loadRequests();}catch(e){$('catMessage').textContent=e.message;}}
+async function saveCategory(row){const id=row.dataset.cat;try{await api('/api/admin/categories/'+id,{method:'PATCH',body:JSON.stringify({searchTerm:row.querySelector('[data-f="search"]').value.trim(),whatsappGroupId:row.querySelector('[data-f="wa"]').value,active:row.querySelector('[data-f="active"]').checked,publicVisible:row.querySelector('[data-f="public"]').checked,mirrorToGeneral:row.querySelector('[data-f="mirror"]').checked})});$('catMessage').textContent='Categoria atualizada.';await loadCategories();}catch(e){alert(e.message);}}
+async function deleteCategory(row){if(!confirm('Excluir esta categoria? Se ela já estiver em uso, o sistema impedirá a exclusão.'))return;try{await api('/api/admin/categories/'+row.dataset.cat,{method:'DELETE'});await loadCategories();}catch(e){alert(e.message);}}
+async function loadProducts(){try{const d=await api('/api/admin/products');const M=catMap();if(!d.products.length){$('content').innerHTML='<div class="empty">Nenhum produto fixado ainda.</div>';return;}$('content').innerHTML='<table><thead><tr><th>Produto</th><th>Categoria</th><th>Status</th><th>Última publicação</th><th>Publicado em</th><th>Adicionado</th><th>Ações</th></tr></thead><tbody>'+d.products.map(p=>'<tr><td><strong>'+esc(p.product_id)+'</strong></td><td>'+esc(M[p.group_key]||p.group_key)+'</td><td><span class="pill '+(p.active?'':'off')+'">'+(p.active?'ATIVO':'PAUSADO')+'</span></td><td>'+(p.last_price==null?'—':money(p.last_price))+(p.last_discount==null?'':'<br><small>'+Number(p.last_discount).toFixed(1)+'% OFF</small>')+'</td><td>'+fmtDate(p.last_sent_at)+'</td><td>'+fmtDate(p.created_at)+'</td><td class="actions"><button class="secondary" data-toggle="'+esc(p.product_id)+'" data-active="'+(!p.active)+'">'+(p.active?'Pausar':'Ativar')+'</button><button class="danger" data-remove="'+esc(p.product_id)+'">Excluir</button></td></tr>').join('')+'</tbody></table>';$('content').querySelectorAll('[data-toggle]').forEach(b=>b.onclick=async()=>{await api('/api/admin/products/'+encodeURIComponent(b.dataset.toggle),{method:'PATCH',body:JSON.stringify({active:b.dataset.active==='true'})});loadProducts();});$('content').querySelectorAll('[data-remove]').forEach(b=>b.onclick=async()=>{if(confirm('Remover produto?')){await api('/api/admin/products/'+encodeURIComponent(b.dataset.remove),{method:'DELETE'});loadProducts();}});}catch(e){$('content').innerHTML='<div class="empty">Erro: '+esc(e.message)+'</div>';}}
+async function addProduct(){const value=$('product').value.trim(),groupKey=$('group').value;if(!value||!groupKey)return;try{await api('/api/admin/products',{method:'POST',body:JSON.stringify({value,groupKey})});$('product').value='';$('message').textContent='Produto adicionado.';loadProducts();}catch(e){$('message').textContent=e.message;}}
+const statusInfo={pendente:'PENDENTE',em_analise:'EM ANÁLISE',aprovado:'APROVADO',rejeitado:'REJEITADO',precisa_contato:'PRECISA CONTATO'};function digits(v){const d=String(v||'').replace(/\D/g,'');return(d.length===10||d.length===11)?'55'+d:d;}
+async function loadRequests(){try{const d=await api('/api/admin/community-requests');const M=catMap();if(!d.requests.length){$('requests').innerHTML='<div class="empty">Nenhuma solicitação.</div>';return;}$('requests').innerHTML=d.requests.map(r=>{const group=r.approved_group_key||r.suggested_group_key;const search=r.approved_search_term||r.desired_item||'';const ref=r.reference_url?'<div class="note"><strong>Link:</strong> <a target="_blank" style="color:#72eda0" href="'+esc(r.reference_url)+'">abrir referência</a></div>':'';const pedido=r.desired_item?'<div class="note"><strong>Pedido:</strong> '+esc(r.desired_item)+'</div>':'<div class="note"><strong>Pedido:</strong> somente link de referência</div>';return '<div class="request" data-request="'+r.id+'"><div class="request-head"><div><h3>#'+r.id+' — '+esc(r.name)+'</h3><div class="meta">'+fmtDate(r.created_at)+' · <a style="color:#72eda0" target="_blank" href="https://wa.me/'+esc(digits(r.whatsapp))+'">'+esc(r.whatsapp)+'</a></div></div><span class="pill">'+esc(statusInfo[r.status]||r.status)+'</span></div>'+pedido+ref+'<div class="note"><strong>Categoria sugerida:</strong> '+esc(M[r.suggested_group_key]||r.suggested_group_key)+'</div>'+(r.notes?'<div class="note"><strong>Observação:</strong> '+esc(r.notes)+'</div>':'')+'<div class="request-grid"><div><label>Termo que o Auvello pesquisará</label><input data-f="search" maxlength="180" value="'+esc(search)+'" placeholder="Digite manualmente se o usuário enviou só o link"></div><div><label>Categoria validada</label><select data-f="group">'+activeOptions(group)+'</select></div></div><div class="community-actions"><button class="secondary" data-status="em_analise">Em análise</button><button data-status="aprovado">Aprovar</button><button class="secondary" data-status="precisa_contato">Precisa contato</button><button class="danger" data-status="rejeitado">Rejeitar</button></div></div>';}).join('');$('requests').querySelectorAll('[data-request]').forEach(card=>card.querySelectorAll('[data-status]').forEach(b=>b.onclick=()=>updateRequest(card,b.dataset.status)));}catch(e){$('requests').innerHTML='<div class="empty">Erro: '+esc(e.message)+'</div>';}}
+async function updateRequest(card,status){const search=card.querySelector('[data-f="search"]').value.trim(),groupKey=card.querySelector('[data-f="group"]').value;if(status==='aprovado'&&!search)return alert('Digite o termo de busca antes de aprovar.');try{await api('/api/admin/community-requests/'+card.dataset.request,{method:'PATCH',body:JSON.stringify({status,approvedSearchTerm:search,approvedGroupKey:groupKey})});loadRequests();}catch(e){alert(e.message);}}
+$('catAdd').onclick=createCategory;$('add').onclick=addProduct;$('refresh').onclick=loadProducts;$('refreshRequests').onclick=loadRequests;(async()=>{await loadWhatsAppGroups();await loadCategories();await loadProducts();await loadRequests();})();
+</script></body></html>`);
+});
+
+app.get("/api/admin/categories", adminAuth, async (_req, res) => {
+  try { res.json({ categories: await listCategories() }); }
+  catch (error) { console.error("[admin/categories] list:", error); res.status(500).json({ error: "Não foi possível listar as categorias." }); }
+});
+
+app.post("/api/admin/categories", adminAuth, async (req, res) => {
+  const name = normalizeText(req.body?.name, 100);
+  const searchTerm = normalizeText(req.body?.searchTerm, 180) || null;
+  const rawGroupId = String(req.body?.whatsappGroupId || "").trim();
+  const whatsappGroupId = rawGroupId ? normalizeGroupId(rawGroupId) : null;
+  const publicVisible = req.body?.publicVisible !== false;
+  const mirrorToGeneral = req.body?.mirrorToGeneral !== false;
+  if (name.length < 2) return res.status(400).json({ error: "Informe um nome para a categoria." });
+  if (rawGroupId && !whatsappGroupId) return res.status(400).json({ error: "Grupo do WhatsApp inválido." });
+  const groupKey = slugifyGroupKey(name);
+  if (!groupKey || groupKey === "geral") return res.status(400).json({ error: "Nome de categoria inválido ou reservado." });
+  try {
+    await ensureAdminTable();
+    const { rows } = await adminPool.query(
+      `INSERT INTO auvello_categories (group_key,name,whatsapp_group_id,search_term,active,public_visible,mirror_to_general,created_at,updated_at)
+       VALUES ($1,$2,$3,$4,TRUE,$5,$6,NOW(),NOW()) RETURNING *`,
+      [groupKey,name,whatsappGroupId,searchTerm,publicVisible,mirrorToGeneral]
+    );
+    res.status(201).json({ category: rows[0] });
   } catch (error) {
-    console.error("[whatsapp/send/direct]", error);
-    return res.status(500).json({ error: "Nao foi possivel enviar a mensagem." });
+    if (error?.code === "23505") return res.status(409).json({ error: "Já existe uma categoria com esse nome/chave." });
+    console.error("[admin/categories] create:", error); res.status(500).json({ error: "Não foi possível criar a categoria." });
   }
 });
 
-const videoPool = process.env.DATABASE_URL?.trim()
-  ? new pg.Pool({ connectionString: process.env.DATABASE_URL.trim(), max: 2,
-                  connectionTimeoutMillis: 15000, idleTimeoutMillis: 30000 }) : null;
-app.post('/send/video-asset', createVideoHandler({
-  authorized: directSendAuthorized,
-  getSocket: () => ready ? sock : null,
-  pool: videoPool,
-  recipient: process.env.VIDEOS_WHATSAPP_PHONE?.trim() || DEFAULT_VIDEO_PHONE,
-}));
-
-const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, async () => {
-  console.log(`Auvello WhatsApp Service na porta ${PORT}`);
-
-  try {
-    await connectWhatsApp();
-  } catch (error) {
-    console.error("[whatsapp] falha ao iniciar:", error);
-  }
+app.patch("/api/admin/categories/:id", adminAuth, async (req, res) => {
+  const id = Number(req.params.id); if (!Number.isInteger(id)||id<=0) return res.status(400).json({ error: "ID inválido." });
+  const searchTerm = normalizeText(req.body?.searchTerm,180)||null;
+  const rawGroupId = String(req.body?.whatsappGroupId||"").trim(); const whatsappGroupId=rawGroupId?normalizeGroupId(rawGroupId):null;
+  if(rawGroupId&&!whatsappGroupId)return res.status(400).json({error:"Grupo do WhatsApp inválido."});
+  try{await ensureAdminTable();const {rows}=await adminPool.query(`UPDATE auvello_categories SET search_term=$2,whatsapp_group_id=$3,active=$4,public_visible=$5,mirror_to_general=$6,updated_at=NOW() WHERE id=$1 RETURNING *`,[id,searchTerm,whatsappGroupId,Boolean(req.body?.active),Boolean(req.body?.publicVisible),Boolean(req.body?.mirrorToGeneral)]);if(!rows[0])return res.status(404).json({error:"Categoria não encontrada."});res.json({category:rows[0]});}catch(error){console.error("[admin/categories] update:",error);res.status(500).json({error:"Não foi possível atualizar a categoria."});}
 });
+
+app.delete("/api/admin/categories/:id", adminAuth, async (req,res)=>{
+  const id=Number(req.params.id);if(!Number.isInteger(id)||id<=0)return res.status(400).json({error:"ID inválido."});
+  try{await ensureAdminTable();const {rows}=await adminPool.query("SELECT group_key FROM auvello_categories WHERE id=$1 LIMIT 1",[id]);if(!rows[0])return res.status(404).json({error:"Categoria não encontrada."});const key=rows[0].group_key;const used=await adminPool.query(`SELECT (SELECT COUNT(*) FROM admin_monitored_products WHERE group_key=$1) + (SELECT COUNT(*) FROM community_requests WHERE suggested_group_key=$1 OR approved_group_key=$1) AS total`,[key]);if(Number(used.rows[0]?.total||0)>0)return res.status(409).json({error:"Esta categoria já está em uso. Pause-a em vez de excluir, ou remova/mova os registros associados."});await adminPool.query("DELETE FROM auvello_categories WHERE id=$1",[id]);res.json({ok:true});}catch(error){console.error("[admin/categories] delete:",error);res.status(500).json({error:"Não foi possível excluir a categoria."});}
+});
+
+app.get("/api/admin/whatsapp-groups", adminAuth, async (_req,res)=>{
+  if(!ready||!sock)return res.json({groups:[]});
+  try{const groups=await sock.groupFetchAllParticipating();res.json({groups:Object.values(groups).map(g=>({id:g.id,subject:g.subject})).sort((a,b)=>a.subject.localeCompare(b.subject,'pt-BR'))});}catch(error){res.status(500).json({error:"Não foi possível listar os grupos do WhatsApp."});}
+});
+
+app.get("/api/admin/products", adminAuth, async (_req, res) => {
+  try { await ensureAdminTable(); const {rows}=await adminPool.query(`SELECT a.id,a.product_id,a.group_key,a.active,a.created_at,a.updated_at,lastn.price AS last_price,lastn.discount_percent AS last_discount,lastn.sent_at AS last_sent_at FROM admin_monitored_products a LEFT JOIN LATERAL (SELECT price,discount_percent,sent_at FROM product_notifications WHERE catalog_product_key=a.product_id AND group_key=a.group_key ORDER BY sent_at DESC LIMIT 1) lastn ON TRUE ORDER BY a.created_at DESC`);res.json({products:rows.map(r=>({...r,in_static_watchlist:isInStaticWatchlist(r.product_id)}))}); }
+  catch(error){console.error("[admin] list:",error);res.status(500).json({error:"Não foi possível listar os produtos."});}
+});
+
+app.post("/api/admin/products", adminAuth, async (req,res)=>{
+  const productId=extractProductId(req.body?.value);const groupKey=String(req.body?.groupKey||"").trim();if(!productId)return res.status(400).json({error:"Não encontrei um PRODUCT_ID válido (MLB...) nesse valor."});const category=await getCategoryByKey(groupKey,{activeOnly:true}).catch(()=>null);if(!category)return res.status(400).json({error:"Categoria inválida ou pausada."});
+  try{const existing=await adminPool.query("SELECT * FROM admin_monitored_products WHERE product_id=$1 LIMIT 1",[productId]);if(existing.rows[0])return res.status(409).json({error:"Produto já cadastrado no Admin.",existing:existing.rows[0]});const {rows}=await adminPool.query(`INSERT INTO admin_monitored_products(product_id,group_key,active,created_at,updated_at) VALUES($1,$2,TRUE,NOW(),NOW()) RETURNING *`,[productId,groupKey]);res.status(201).json({product:rows[0],inStaticWatchlist:isInStaticWatchlist(productId)});}catch(error){console.error("[admin] create:",error);res.status(500).json({error:"Não foi possível cadastrar o produto."});}
+});
+
+app.patch("/api/admin/products/:productId", adminAuth, async (req,res)=>{
+  const productId=extractProductId(req.params.productId);if(!productId)return res.status(400).json({error:"PRODUCT_ID inválido."});const active=req.body?.active;const groupKey=req.body?.groupKey;if(active===undefined&&groupKey===undefined)return res.status(400).json({error:"Informe active ou groupKey."});if(groupKey!==undefined){const category=await getCategoryByKey(String(groupKey),{activeOnly:true}).catch(()=>null);if(!category)return res.status(400).json({error:"Categoria inválida ou pausada."});}
+  try{const current=await adminPool.query("SELECT * FROM admin_monitored_products WHERE product_id=$1 LIMIT 1",[productId]);if(!current.rows[0])return res.status(404).json({error:"Produto não encontrado."});const newActive=active===undefined?current.rows[0].active:Boolean(active),newGroup=groupKey===undefined?current.rows[0].group_key:String(groupKey);const {rows}=await adminPool.query(`UPDATE admin_monitored_products SET active=$2,group_key=$3,updated_at=NOW() WHERE product_id=$1 RETURNING *`,[productId,newActive,newGroup]);res.json({product:rows[0]});}catch(error){console.error("[admin] update:",error);res.status(500).json({error:"Não foi possível atualizar o produto."});}
+});
+
+app.delete("/api/admin/products/:productId", adminAuth, async (req,res)=>{const productId=extractProductId(req.params.productId);if(!productId)return res.status(400).json({error:"PRODUCT_ID inválido."});try{const result=await adminPool.query("DELETE FROM admin_monitored_products WHERE product_id=$1",[productId]);if(!result.rowCount)return res.status(404).json({error:"Produto não encontrado."});res.json({ok:true});}catch(error){res.status(500).json({error:"Não foi possível remover o produto."});}});
+
+app.get("/api/admin/community-requests", adminAuth, async (_req,res)=>{try{await ensureAdminTable();const {rows}=await adminPool.query(`SELECT id,name,whatsapp,reference_url,reference_product_id,desired_item,suggested_group_key,approved_group_key,approved_search_term,notes,status,created_at,updated_at FROM community_requests ORDER BY CASE status WHEN 'pendente' THEN 1 WHEN 'em_analise' THEN 2 WHEN 'precisa_contato' THEN 3 WHEN 'aprovado' THEN 4 WHEN 'rejeitado' THEN 5 ELSE 6 END,created_at DESC LIMIT 150`);res.json({requests:rows});}catch(error){res.status(500).json({error:"Não foi possível listar os pedidos da comunidade."});}});
+
+app.patch("/api/admin/community-requests/:id", adminAuth, async (req,res)=>{
+  const id=Number(req.params.id);if(!Number.isInteger(id)||id<=0)return res.status(400).json({error:"ID inválido."});const allowed=new Set(["pendente","em_analise","aprovado","rejeitado","precisa_contato"]);const status=String(req.body?.status||"").trim(),approvedSearchTerm=normalizeText(req.body?.approvedSearchTerm,180),approvedGroupKey=String(req.body?.approvedGroupKey||"").trim();if(!allowed.has(status))return res.status(400).json({error:"Status inválido."});
+  try{await ensureAdminTable();const current=await adminPool.query("SELECT * FROM community_requests WHERE id=$1 LIMIT 1",[id]);if(!current.rows[0])return res.status(404).json({error:"Solicitação não encontrada."});const finalSearch=approvedSearchTerm||current.rows[0].approved_search_term||current.rows[0].desired_item||"";const finalGroup=approvedGroupKey||current.rows[0].approved_group_key||current.rows[0].suggested_group_key;const category=await getCategoryByKey(finalGroup,{activeOnly:true});if(status==='aprovado'&&(!finalSearch||!category))return res.status(400).json({error:"Para aprovar, informe manualmente o termo de busca e uma categoria ativa."});if(status==='aprovado'){const dup=await adminPool.query(`SELECT id FROM community_requests WHERE id<>$1 AND status='aprovado' AND LOWER(TRIM(approved_search_term))=LOWER(TRIM($2)) AND approved_group_key=$3 LIMIT 1`,[id,finalSearch,finalGroup]);if(dup.rows[0])return res.status(409).json({error:`Já existe um pedido aprovado com esse mesmo termo e categoria (#${dup.rows[0].id}).`});}const {rows}=await adminPool.query(`UPDATE community_requests SET status=$2,approved_search_term=$3,approved_group_key=$4,updated_at=NOW() WHERE id=$1 RETURNING *`,[id,status,finalSearch,finalGroup]);console.log(`[community] #${id} -> ${status}${status==='aprovado'?` | ${finalSearch} -> ${finalGroup}`:''}`);res.json({request:rows[0]});}catch(error){console.error("[admin/community] update:",error);res.status(500).json({error:"Não foi possível atualizar a solicitação."});}
+});
+
+async function connectWhatsApp(){const db=process.env.DATABASE_URL?.trim();const authProvider=db?await useNeonAuthState(db):await useMultiFileAuthState("auth_info");const{state,saveCreds}=authProvider;console.log(db?"[whatsapp] sessao persistida no PostgreSQL/Neon.":"[whatsapp] DATABASE_URL ausente; usando auth_info local.");sock=makeWASocket({auth:state,logger:pino({level:"silent"}),printQRInTerminal:false,syncFullHistory:false,markOnlineOnConnect:false});sock.ev.on("creds.update",saveCreds);sock.ev.on("connection.update",({connection,lastDisconnect,qr})=>{if(qr){latestQr=qr;console.log("\nQR Code atualizado. Abra /qr?key=SEU_QR_SECRET no navegador.\n");qrcodeTerminal.generate(qr,{small:true});}if(connection==="open"){ready=true;latestQr=null;console.log("WhatsApp conectado.");}if(connection==="close"){ready=false;latestQr=null;const error=lastDisconnect?.error;const statusCode=error instanceof Boom?error.output?.statusCode:undefined;const shouldReconnect=statusCode!==DisconnectReason.loggedOut;console.log("WhatsApp desconectado.",shouldReconnect?"Reconectando...":"Sessao encerrada.");if(shouldReconnect)setTimeout(connectWhatsApp,3000);}});}
+app.get("/health",(_req,res)=>res.json({ok:true,whatsappReady:ready}));
+app.get("/qr",async(req,res)=>{const configuredSecret=process.env.QR_SECRET?.trim(),supplied=String(req.query.key||"").trim();if(!configuredSecret||supplied!==configuredSecret)return res.status(401).send("Nao autorizado.");if(ready)return res.status(200).type("html").send("<h2>WhatsApp conectado ✅</h2>");if(!latestQr)return res.status(200).type("html").send('<meta http-equiv="refresh" content="3"><h2>Aguardando QR Code...</h2>');try{const dataUrl=await QRCode.toDataURL(latestQr,{errorCorrectionLevel:"M",margin:2,width:420});return res.status(200).type("html").send(`<h2>Conectar WhatsApp ao Auvello</h2><img src="${dataUrl}" style="max-width:100%">`);}catch(error){return res.status(500).send("Nao foi possivel gerar o QR Code.");}});
+app.get("/groups",async(_req,res)=>{if(!ready||!sock)return res.status(503).json({error:"WhatsApp ainda nao conectado."});try{const groups=await sock.groupFetchAllParticipating();res.json(Object.values(groups).map(g=>({id:g.id,subject:g.subject})));}catch(error){res.status(500).json({error:String(error)});}});
+app.post("/send",async(req,res)=>{if(!ready||!sock)return res.status(503).json({error:"WhatsApp ainda nao conectado."});const{groupId,message,imageUrl}=req.body||{};if(!groupId||!message)return res.status(400).json({error:"Informe groupId e message."});if(!String(groupId).endsWith("@g.us"))return res.status(400).json({error:"groupId deve terminar com @g.us."});try{const result=imageUrl?await sock.sendMessage(groupId,{image:{url:imageUrl},caption:message}):await sock.sendMessage(groupId,{text:message});res.json({ok:true,id:result?.key?.id||null});}catch(error){res.status(500).json({error:String(error)});}});
+
+const PORT=process.env.PORT||3000;app.listen(PORT,async()=>{console.log(`Auvello WhatsApp Service na porta ${PORT}`);await connectWhatsApp();});

@@ -9,6 +9,3 @@ venv/
 whatsapp-service/node_modules/
 whatsapp-service/auth_info/
 .DS_Store
-
-videos_prontos/
-videos_demo/

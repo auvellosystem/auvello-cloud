@@ -42,29 +42,10 @@ class Settings:
     max_products_per_query: int = _int("MAX_PRODUCTS_PER_QUERY", 5)
     request_timeout: int = _int("REQUEST_TIMEOUT", 20)
 
-    # Shopee Affiliate API. Quando as credenciais não estiverem preenchidas,
-    # a descoberta da Shopee é simplesmente ignorada e o Mercado Livre segue.
-    shopee_enabled: bool = _bool("SHOPEE_ENABLED", True)
-    shopee_app_id: str = os.getenv("SHOPEE_APP_ID", "").strip()
-    shopee_secret: str = os.getenv("SHOPEE_SECRET", "").strip()
-    shopee_api_url: str = os.getenv(
-        "SHOPEE_API_URL",
-        "https://open-api.affiliate.shopee.com.br/graphql",
-    ).strip()
-    shopee_max_terms_per_cycle: int = _int("SHOPEE_MAX_TERMS_PER_CYCLE", 12)
-    shopee_products_per_term: int = _int("SHOPEE_PRODUCTS_PER_TERM", 20)
-
     min_discount_percent: float = _float("MIN_DISCOUNT_PERCENT", 15)
     big_discount_percent: float = _float("BIG_DISCOUNT_PERCENT", 20)
     min_price_drop_percent: float = _float("MIN_PRICE_DROP_PERCENT", 10)
-    cooldown_hours: int = _int("COOLDOWN_HOURS", 24)  # legado
-    specific_product_cooldown_hours: int = _int("SPECIFIC_PRODUCT_COOLDOWN_HOURS", 36)
-    general_product_cooldown_hours: int = _int("GENERAL_PRODUCT_COOLDOWN_HOURS", 72)
-    general_category_cooldown_minutes: int = _int("GENERAL_CATEGORY_COOLDOWN_MINUTES", 60)
-    general_type_cooldown_hours: int = _int("GENERAL_TYPE_COOLDOWN_HOURS", 6)
-    # Produtos fixados no Admin: oferta melhor libera imediatamente; oferta
-    # igual só pode repetir após este intervalo; oferta pior não repete.
-    fixed_product_cooldown_hours: int = _int("FIXED_PRODUCT_COOLDOWN_HOURS", 12)
+    cooldown_hours: int = _int("COOLDOWN_HOURS", 24)
     # Scheduler desacoplado: descoberta no Mercado Livre e publicação usam
     # relógios independentes. O grupo Geral reaproveita o cache e não força
     # uma nova busca no Mercado Livre a cada 5 minutos.
