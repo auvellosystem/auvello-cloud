@@ -1,5 +1,7 @@
 import express from "express";
 import fs from "node:fs";
+import { execFile } from "node:child_process";
+import { timingSafeEqual } from "node:crypto";
 import { Pool } from "pg";
 import qrcodeTerminal from "qrcode-terminal";
 import QRCode from "qrcode";
@@ -381,6 +383,29 @@ app.patch("/api/admin/community-requests/:id", adminAuth, async (req,res)=>{
 });
 
 async function connectWhatsApp(){const db=process.env.DATABASE_URL?.trim();const authProvider=db?await useNeonAuthState(db):await useMultiFileAuthState("auth_info");const{state,saveCreds}=authProvider;console.log(db?"[whatsapp] sessao persistida no PostgreSQL/Neon.":"[whatsapp] DATABASE_URL ausente; usando auth_info local.");sock=makeWASocket({auth:state,logger:pino({level:"silent"}),printQRInTerminal:false,syncFullHistory:false,markOnlineOnConnect:false});sock.ev.on("creds.update",saveCreds);sock.ev.on("connection.update",({connection,lastDisconnect,qr})=>{if(qr){latestQr=qr;console.log("\nQR Code atualizado. Abra /qr?key=SEU_QR_SECRET no navegador.\n");qrcodeTerminal.generate(qr,{small:true});}if(connection==="open"){ready=true;latestQr=null;console.log("WhatsApp conectado.");}if(connection==="close"){ready=false;latestQr=null;const error=lastDisconnect?.error;const statusCode=error instanceof Boom?error.output?.statusCode:undefined;const shouldReconnect=statusCode!==DisconnectReason.loggedOut;console.log("WhatsApp desconectado.",shouldReconnect?"Reconectando...":"Sessao encerrada.");if(shouldReconnect)setTimeout(connectWhatsApp,3000);}});}
+// Provedor restrito: entrega apenas access_token; renovacao fica neste servico.
+app.get("/api/internal/ml-token", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  const secret = process.env.ML_TOKEN_PROVIDER_SECRET || "";
+  const expected = Buffer.from("Bearer " + secret);
+  const actual = Buffer.from(req.headers.authorization || "");
+  if (!secret) return res.status(503).json({ error: "Provedor nao configurado." });
+  if (actual.length !== expected.length || !timingSafeEqual(actual, expected))
+    return res.status(401).json({ error: "Nao autorizado." });
+  execFile("python3", ["-m", "app.token_provider"], {
+    cwd: process.cwd(), timeout: 60000, maxBuffer: 262144,
+  }, (error, stdout) => {
+    if (error) return res.status(503).json({ error: "Autorizacao indisponivel no servico principal." });
+    try {
+      const data = JSON.parse(stdout);
+      if (!data.access_token || !Number.isFinite(Number(data.expires_at))) throw new Error("invalid");
+      res.json({ access_token: data.access_token, expires_at: Number(data.expires_at) });
+    } catch {
+      res.status(503).json({ error: "Resposta indisponivel no servico principal." });
+    }
+  });
+});
+
 app.get("/health",(_req,res)=>res.json({ok:true,whatsappReady:ready}));
 app.get("/qr",async(req,res)=>{const configuredSecret=process.env.QR_SECRET?.trim(),supplied=String(req.query.key||"").trim();if(!configuredSecret||supplied!==configuredSecret)return res.status(401).send("Nao autorizado.");if(ready)return res.status(200).type("html").send("<h2>WhatsApp conectado ✅</h2>");if(!latestQr)return res.status(200).type("html").send('<meta http-equiv="refresh" content="3"><h2>Aguardando QR Code...</h2>');try{const dataUrl=await QRCode.toDataURL(latestQr,{errorCorrectionLevel:"M",margin:2,width:420});return res.status(200).type("html").send(`<h2>Conectar WhatsApp ao Auvello</h2><img src="${dataUrl}" style="max-width:100%">`);}catch(error){return res.status(500).send("Nao foi possivel gerar o QR Code.");}});
 app.get("/groups",async(_req,res)=>{if(!ready||!sock)return res.status(503).json({error:"WhatsApp ainda nao conectado."});try{const groups=await sock.groupFetchAllParticipating();res.json(Object.values(groups).map(g=>({id:g.id,subject:g.subject})));}catch(error){res.status(500).json({error:String(error)});}});

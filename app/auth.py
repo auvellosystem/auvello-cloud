@@ -16,6 +16,7 @@ from .config import settings
 AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
 TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
 TOKEN_PROVIDER = "mercado_livre"
+_remote_token_cache: tuple[str, float] | None = None
 
 
 def _store_path() -> Path:
@@ -101,6 +102,8 @@ def _pkce_pair() -> tuple[str, str]:
 
 
 def authorize_interactively() -> dict:
+    if settings.ml_token_provider_url:
+        raise RuntimeError("O projeto usa a autorizacao do Render principal; nao execute --auth.")
     if not settings.client_id or not settings.client_secret or not settings.redirect_uri:
         raise RuntimeError("Configure ML_CLIENT_ID, ML_CLIENT_SECRET e ML_REDIRECT_URI no .env.")
 
@@ -161,6 +164,8 @@ def refresh_access_token(refresh_token: str) -> dict:
 
 
 def get_valid_access_token() -> str:
+    if settings.ml_token_provider_url:
+        return _get_remote_access_token()
     tokens = load_tokens()
     if not tokens:
         tokens = authorize_interactively()
@@ -178,3 +183,34 @@ def get_valid_access_token() -> str:
 
     tokens = authorize_interactively()
     return tokens["access_token"]
+
+
+def _get_remote_access_token() -> str:
+    global _remote_token_cache
+    if not settings.ml_token_provider_url.startswith("https://"):
+        raise RuntimeError("ML_TOKEN_PROVIDER_URL deve usar HTTPS.")
+    if not settings.ml_token_provider_secret:
+        raise RuntimeError("Configure ML_TOKEN_PROVIDER_SECRET nos dois servicos.")
+    now = time.time()
+    if _remote_token_cache and now < _remote_token_cache[1]:
+        return _remote_token_cache[0]
+    try:
+        response = requests.get(
+            settings.ml_token_provider_url + "/api/internal/ml-token",
+            headers={"Authorization": "Bearer " + settings.ml_token_provider_secret},
+            timeout=(10, 90), allow_redirects=False,
+        )
+    except requests.RequestException:
+        raise RuntimeError("Nao foi possivel acessar o provedor de autorizacao.") from None
+    if response.status_code != 200:
+        raise RuntimeError(f"Provedor de autorizacao respondeu HTTP {response.status_code}; confira o deploy e a chave.")
+    try:
+        data = response.json()
+        token = data["access_token"]
+        expires_at = float(data["expires_at"])
+        if not isinstance(token, str) or not token or expires_at <= time.time():
+            raise ValueError("expired")
+    except (KeyError, TypeError, ValueError):
+        raise RuntimeError("Provedor retornou uma autorizacao invalida ou expirada.") from None
+    _remote_token_cache = (token, min(expires_at - 30, time.time() + 240))
+    return token
